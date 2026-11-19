@@ -53,11 +53,15 @@
 ///
 /// # Version coupling
 ///
-/// `webview2-com` and `windows-core` must be the same major versions Tauri and
-/// wry link, because [`tauri::webview::PlatformWebview::controller`] hands back
-/// *their* `ICoreWebView2Controller`. A mismatch shows up as
-/// "no method named `cast`" or a type error on the controller — check what
-/// `tauri`'s own `Cargo.toml` requires before bumping either.
+/// `webview2-com` and `windows-core` must be the same versions wry links,
+/// because `tauri_runtime_wry::Webview::controller` hands back *their*
+/// `ICoreWebView2Controller`. A mismatch shows up as "no method named `cast`"
+/// or a type error on the controller — check what `tauri-runtime-wry`'s own
+/// `Cargo.toml` requires before bumping either.
+///
+/// **This body only compiles in the release profile on Windows**, so a plain
+/// `cargo check` proves nothing about it. Run `cargo check --release` after
+/// touching the webview stack (AGENTS.md says the same).
 #[cfg(all(target_os = "windows", not(debug_assertions)))]
 pub fn disable_browser_accelerator_keys(window: &tauri::WebviewWindow) {
     // The closure runs on the UI thread and must own everything it touches, so
@@ -71,6 +75,20 @@ pub fn disable_browser_accelerator_keys(window: &tauri::WebviewWindow) {
         unsafe {
             use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
             use windows_core::Interface;
+
+            // Tauri 3 runs the app under the type-erased `DynRuntime`, so the
+            // `PlatformWebview` handed in here wraps a `DynWebview` with no
+            // `controller()` of its own. Downcasting to the concrete wry
+            // `Webview` is how a runtime-specific API is reached now. It can
+            // only fail if the app were built on a different runtime (CEF),
+            // which has no WebView2 controller to configure anyway.
+            let Some(webview) = webview.downcast_ref::<tauri_runtime_wry::Webview>() else {
+                log::warn!(
+                    "[hardening] The webview for '{label}' is not a wry webview — \
+                     browser accelerator keys left as they are"
+                );
+                return;
+            };
 
             // ICoreWebView2Settings3 is the interface that carries the
             // accelerator switch; older runtimes only implement Settings2, so

@@ -75,12 +75,54 @@ interface DocSource {
 const DOC_SOURCES: readonly DocSource[] = [
   {
     id: 'tauri',
-    title: 'Tauri 2 — desktop shell, IPC, capabilities, updater, bundling',
+    title: 'Tauri guides — desktop shell, IPC, capabilities, updater, bundling',
     repo: 'tauri-apps/tauri-docs',
+    // Deliberately still `v2`, although the app runs on Tauri 3. The docs
+    // repo's `v3` branch is `v2` plus two "v3 docs (alpha)" commits and sits
+    // ~77 commits behind it (checked 2026-11-19), so `v2` is the more complete
+    // *prose* reference. Concepts (capabilities, CSP, the updater, bundling)
+    // carry over; API signatures do not — read those from `tauri-v3` below.
     branch: 'v2',
     dir: 'tauri-docs',
     entry: 'src/content/docs',
-    why: 'Backend/runtime authority: permissions & capabilities, plugin APIs, tray, updater, CSP, distribution.',
+    why: 'Concept authority: permissions & capabilities, plugin usage, tray, updater, CSP, distribution. Written for Tauri 2 — check every API signature against the tauri-v3 mirror.',
+  },
+  {
+    id: 'tauri-v3',
+    title: 'Tauri 3 (alpha) — core source, changesets and crate changelogs',
+    repo: 'tauri-apps/tauri',
+    branch: 'v3',
+    dir: 'tauri-v3',
+    // `.changes/` holds one markdown changeset per unreleased change, each
+    // naming its bump level and the breaking change in prose — for an alpha
+    // with no migration guide yet, that directory IS the migration guide. The
+    // two crates are the API surface this app calls (`tauri`) and the runtime
+    // it selects (`tauri-runtime-wry`); each carries its own CHANGELOG.md.
+    sparse: ['.changes', 'crates/tauri', 'crates/tauri-runtime-wry'],
+    entry: '.changes',
+    searchExtensions: ['.md', '.rs'],
+    why: 'The app pins the Tauri 3 alpha family (src-tauri/Cargo.toml). The guides above document Tauri 2; this is where a v3 API, a removed feature (macos-private-api, tauri::Wry) or a renamed builder method is actually defined.',
+  },
+  {
+    id: 'tauri-plugins-v3',
+    title: 'Tauri 3 plugins — the six plugins this app links, v3 branch',
+    repo: 'tauri-apps/plugins-workspace',
+    branch: 'v3',
+    dir: 'tauri-plugins-v3',
+    // Only the plugins `src-tauri/Cargo.toml` names. They are consumed as git
+    // dependencies tracking this exact branch, so this mirror is the source
+    // that is compiled, not a description of it.
+    sparse: [
+      'plugins/autostart',
+      'plugins/log',
+      'plugins/notification',
+      'plugins/process',
+      'plugins/single-instance',
+      'plugins/updater',
+    ],
+    entry: 'plugins',
+    searchExtensions: ['.md', '.rs', '.ts'],
+    why: 'Plugin READMEs, permissions and both halves of each plugin (Rust + guest-js) at the commit the app builds against. Add a directory here when the app adopts a new plugin.',
   },
   {
     id: 'solid',
@@ -116,7 +158,12 @@ const DOC_SOURCES: readonly DocSource[] = [
     repo: 'microsoft/typescript-go',
     branch: 'main',
     dir: 'typescript-go',
-    sparse: ['docs', 'CHANGES.md', 'README.md'],
+    // `CHANGES.md` and `README.md` sit at the repository root, which cone mode
+    // materializes on its own. They used to be listed here too, and git ≥ 2.50
+    // rejects a file in a cone-mode set ("'CHANGES.md' is not a directory"),
+    // which failed this source — and, before the per-source isolation in
+    // `main()`, every source after it.
+    sparse: ['docs'],
     entry: '.',
     why: 'This repo pins a TypeScript 7 dev build. CHANGES.md is the authoritative list of TS7 behavioural differences — see TYPESCRIPT-7.md.',
   },
@@ -512,10 +559,30 @@ function main() {
   }
 
   mkdirSync(DOCS_DIR, { recursive: true });
-  const statuses = selected.map(syncSource);
+  // One source failing must not cost the others their refresh. A thrown git
+  // error used to abort the whole run at that source, so a single rejected
+  // sparse pattern left every later mirror silently stale — and the status
+  // table, the one place that would have shown it, was never printed. Each
+  // source is attempted, the failures are named at the end, and the exit code
+  // still says the run was incomplete.
+  const failed: string[] = [];
+  const statuses = selected.map((source) => {
+    try {
+      return syncSource(source);
+    } catch (error: unknown) {
+      const reason = error instanceof Error ? error.message.split('\n')[0] : String(error);
+      console.error(`${RED}✗ ${source.id}: ${reason}${RESET}`);
+      failed.push(source.id);
+      return statusOf(source);
+    }
+  });
   // The generated index must describe every source, not just the --only subset.
   writeMirrorReadme(onlyId ? DOC_SOURCES.map(statusOf) : statuses);
   printStatus(statuses);
+  if (failed.length > 0) {
+    console.error(`${RED}${failed.length} source(s) failed to sync: ${failed.join(', ')}${RESET}`);
+    process.exit(1);
+  }
 }
 
 main();

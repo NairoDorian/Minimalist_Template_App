@@ -43,14 +43,16 @@ across an upstream force-push.
 
 ## 2. The mirrors
 
-| Layer                        | Local path                           | Tracks       | Upstream                                                                        |
-| ---------------------------- | ------------------------------------ | ------------ | ------------------------------------------------------------------------------- |
-| **Tauri 2**                  | `.docs/tauri-docs/src/content/docs/` | `v2`         | [tauri-apps/tauri-docs](https://github.com/tauri-apps/tauri-docs/tree/v2)       |
-| **SolidJS 2**                | `.docs/solid-docs/src/routes/`       | `v2-rebuild` | [solidjs/solid-docs](https://github.com/solidjs/solid-docs/tree/v2-rebuild)     |
-| **Bun**                      | `.docs/bun-docs/content/docs/`       | `main`       | [RiskyMH/bun-docs](https://github.com/RiskyMH/bun-docs)                         |
-| **TypeScript**               | `.docs/typescript-website/packages/` | `v2`         | [microsoft/TypeScript-Website](https://github.com/microsoft/TypeScript-Website) |
-| **TypeScript 7 (native)**    | `.docs/typescript-go/CHANGES.md`     | `main`       | [microsoft/typescript-go](https://github.com/microsoft/typescript-go)           |
-| **Reference implementation** | `.docs/aivorelay/src-tauri/src/`     | `main`       | [MaxITService/AIVORelay](https://github.com/MaxITService/AIVORelay)             |
+| Layer                        | Local path                                 | Tracks       | Upstream                                                                                |
+| ---------------------------- | ------------------------------------------ | ------------ | --------------------------------------------------------------------------------------- |
+| **Tauri guides** (concepts)  | `.docs/tauri-docs/src/content/docs/`       | `v2`         | [tauri-apps/tauri-docs](https://github.com/tauri-apps/tauri-docs/tree/v2)               |
+| **Tauri 3 core** (API truth) | `.docs/tauri-v3/` (`.changes/`, `crates/`) | `v3`         | [tauri-apps/tauri](https://github.com/tauri-apps/tauri/tree/v3)                         |
+| **Tauri 3 plugins**          | `.docs/tauri-plugins-v3/plugins/`          | `v3`         | [tauri-apps/plugins-workspace](https://github.com/tauri-apps/plugins-workspace/tree/v3) |
+| **SolidJS 2**                | `.docs/solid-docs/src/routes/`             | `v2-rebuild` | [solidjs/solid-docs](https://github.com/solidjs/solid-docs/tree/v2-rebuild)             |
+| **Bun**                      | `.docs/bun-docs/content/docs/`             | `main`       | [RiskyMH/bun-docs](https://github.com/RiskyMH/bun-docs)                                 |
+| **TypeScript**               | `.docs/typescript-website/packages/`       | `v2`         | [microsoft/TypeScript-Website](https://github.com/microsoft/TypeScript-Website)         |
+| **TypeScript 7 (native)**    | `.docs/typescript-go/CHANGES.md`           | `main`       | [microsoft/typescript-go](https://github.com/microsoft/typescript-go)                   |
+| **Reference implementation** | `.docs/aivorelay/src-tauri/src/`           | `main`       | [MaxITService/AIVORelay](https://github.com/MaxITService/AIVORelay)                     |
 
 Branch choice is load-bearing, not incidental:
 
@@ -79,7 +81,25 @@ Branch choice is load-bearing, not incidental:
 
 ## 3. Reading map — "I need to know X, read Y"
 
-### Tauri 2 — `.docs/tauri-docs/src/content/docs/`
+### Tauri 3 — read the v3 source first, the v2 guides second
+
+The app runs the **Tauri 3 alpha**, which has no published guide yet. Order of authority:
+
+1. **`.docs/tauri-v3/.changes/*.md`** — one changeset per change since v2, each naming its
+   bump level. This is the migration guide: `runtime-selection.md` (the runtime is selected
+   with `.runtime(tauri_runtime_wry::Wry::default())`; `tauri::Wry` is gone),
+   `wry-runtime-rename.md`, `tauri-tray-ksni.md` (Linux tray backend),
+   `runtime-crate-features.md` (`devtools` lives on the runtime crate), `cli-migrate-v2.md`
+   (what `tauri migrate` rewrites).
+2. **`.docs/tauri-v3/crates/tauri/src/`** and **`crates/tauri-runtime-wry/src/`** — the API as
+   compiled. Check every signature here.
+3. **`.docs/tauri-plugins-v3/plugins/<name>/`** — each plugin's README, permissions, Rust and
+   guest-js at the commit the app builds against. Plugin breaking changes are in that
+   workspace's `.changes/` (e.g. `autostart-manager-ext-rename`, `updater-remove-available`).
+4. **The v2 guides below** for concepts that did not change — capabilities, CSP, updater
+   signing, bundling. Their code samples are Tauri 2: translate before copying.
+
+### Tauri guides (v2) — `.docs/tauri-docs/src/content/docs/`
 
 | Question                                                                              | Read                                                                                   |
 | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |

@@ -1,6 +1,6 @@
 # Minimalistic App
 
-The ultimate minimalistic, high-performance cross-platform desktop application template powered by **Tauri 2**, **Bun.js**, **SolidJS 2**, **TypeScript 7**, and **Cargo (Rust 2024 Edition)**.
+The ultimate minimalistic, high-performance cross-platform desktop application template powered by **Tauri 3 (alpha)**, **Bun.js**, **SolidJS 2**, **TypeScript 7**, and **Cargo (Rust 2024 Edition)**.
 
 Designed with a sleek **100% AMOLED Deep Black glassmorphic GUI (`#000000`)**, this application operates as a background utility residing in your operating system's taskbar / system tray with full left-click, right-click context menu interaction, and automated auto-updater support.
 
@@ -167,17 +167,17 @@ Follow these steps **in this order** when bumping the version, preparing a relea
 
 ### `bun run before-commit` — Every Mode
 
-| Command                                | Effect                                                                                                                                                               | Writes? |
-| :------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------ |
-| `bun run before-commit`                | Sync `APP_VERSION` from `scripts/version.ts` into `package.json`, `Cargo.toml`, `tauri.conf.json` (+ `Cargo.lock` via `cargo generate-lockfile`); per-mirror report. | Yes     |
-| `bun run before-commit --check`        | Read-only drift validation; exits `1` on any mismatch. Safe for CI / hooks.                                                                                          | No      |
-| `bun run before-commit --bump patch`   | `0.9.0 → 0.9.1` then sync.                                                                                                                                           | Yes     |
-| `bun run before-commit --bump minor`   | `0.9.0 → 0.10.0` then sync.                                                                                                                                          | Yes     |
-| `bun run before-commit --bump major`   | `0.9.0 → 1.0.0` then sync.                                                                                                                                           | Yes     |
-| `bun run before-commit --install-hook` | Install `.git/hooks/pre-commit` running `--check`; refuses to overwrite an existing hook.                                                                            | Yes     |
-| `bun run before-commit --help`         | Print usage.                                                                                                                                                         | No      |
+| Command                                | Effect                                                                                                                                                                             | Writes? |
+| :------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------ |
+| `bun run before-commit`                | Sync `APP_VERSION` from `scripts/version.ts` into `package.json`, `Cargo.toml`, `tauri.conf.json` (+ the root crate's own block in `Cargo.lock`, nothing else); per-mirror report. | Yes     |
+| `bun run before-commit --check`        | Read-only drift validation; exits `1` on any mismatch. Safe for CI / hooks.                                                                                                        | No      |
+| `bun run before-commit --bump patch`   | `0.9.0 → 0.9.1` then sync.                                                                                                                                                         | Yes     |
+| `bun run before-commit --bump minor`   | `0.9.0 → 0.10.0` then sync.                                                                                                                                                        | Yes     |
+| `bun run before-commit --bump major`   | `0.9.0 → 1.0.0` then sync.                                                                                                                                                         | Yes     |
+| `bun run before-commit --install-hook` | Install `.git/hooks/pre-commit` running `--check`; refuses to overwrite an existing hook.                                                                                          | Yes     |
+| `bun run before-commit --help`         | Print usage.                                                                                                                                                                       | No      |
 
-Details: after a bump, a missing `## [<version>]` changelog header is an advisory `⚠️`, never a blocker. Invalid usage (`--bump` without a part, unknown part, `--check --bump` together) exits `1` with a descriptive message. The `Cargo.lock` refresh is `cargo generate-lockfile`, which re-resolves **every** crate to the newest version its spec allows, not just the root entry — a bump is also a Rust dependency refresh, so run `bun run validate` before committing one.
+Details: after a bump, a missing `## [<version>]` changelog header is an advisory `⚠️`, never a blocker. Invalid usage (`--bump` without a part, unknown part, `--check --bump` together) exits `1` with a descriptive message. Since 0.28.0 the `Cargo.lock` refresh stamps only the root crate's own `[[package]]` block — it used to run `cargo generate-lockfile`, which re-resolved every crate (and would now also move the git-tracked Tauri plugins). Moving dependencies is `bun run update`'s job (see the routine in AGENTS.md).
 
 ---
 
@@ -267,7 +267,7 @@ scripts/version.ts  (APP_VERSION)  ← THE ONLY PLACE THE VERSION IS DEFINED
    ├── package.json                (synced by before-commit.ts)
    ├── src-tauri/Cargo.toml        (synced by before-commit.ts)
    ├── src-tauri/tauri.conf.json   (synced by before-commit.ts → drives artifacts + updater feed)
-   ├── src-tauri/Cargo.lock        (refreshed via cargo generate-lockfile)
+   ├── src-tauri/Cargo.lock        (root crate block stamped; dependencies untouched)
    └── __APP_VERSION__ (Vite define)  ← imported directly by vite.config.ts
 ```
 
@@ -461,7 +461,7 @@ command and committing without launching the app leaves the frontend calling a
 contract the backend no longer has. A test now compares the `collect_commands![…]`
 registry against the generated wrappers as source text, and fails the commit
 instead of the user. (It has to be a source comparison: re-rendering the bindings
-from a Rust test links `tauri::Wry` and the test binary will not start on Windows
+from a Rust test links the webview runtime and the test binary will not start on Windows
 without the webview runtime beside it.)
 
 ### 🩹 Self-Healing Settings (`settings_repair.rs`)
@@ -565,19 +565,24 @@ returns an `Outcome`, so swapping in `CliArgs::try_parse_from` touches one file.
 
 ## 🛠️ Tech Stack & Absolute @latest Versions
 
-| Tool / Library   | Version                                 | Purpose                                                |
-| :--------------- | :-------------------------------------- | :----------------------------------------------------- |
-| **Bun.js**       | `1.4+` (lockfile v2, isolated linker)   | Runtime, script runner & package manager               |
-| **Tauri**        | `^2.11.5`                               | Lightweight cross-platform native desktop shell        |
-| **SolidJS 2**    | `2.0.0-rc.1`                            | Frontend component framework (fine-grained reactivity) |
-| **TypeScript**   | `7.1.0-dev.*` (nightly, `next` channel) | Strict static type checking (TypeScript 7)             |
-| **Vite**         | `8.2.2`                                 | Frontend dev server & production bundler (Vite 8)      |
-| **Cargo / Rust** | `2024 edition`                          | Native system tray & background process backend        |
+| Tool / Library    | Version                                              | Purpose                                                         |
+| :---------------- | :--------------------------------------------------- | :-------------------------------------------------------------- |
+| **Bun.js**        | `1.4+` (lockfile v2, isolated linker)                | Runtime, script runner & package manager                        |
+| **Tauri**         | `=3.0.0-alpha.6` (whole family pinned as one set)    | Lightweight cross-platform native desktop shell                 |
+| **Tauri plugins** | `plugins-workspace@v3` (git) · JS `3.0.0-alpha.3`    | Autostart, log, notification, process, single-instance, updater |
+| **tauri-specta**  | `2.0.0-rc.29` (Tauri 3 fork) · specta `=2.0.0-rc.28` | Type-safe Rust ↔ TypeScript IPC bindings                        |
+| **SolidJS 2**     | `2.0.3` (stable) · `@solidjs/vite-plugin` `3.0.1`    | Frontend component framework (fine-grained reactivity)          |
+| **TypeScript**    | `7.1.0-dev.*` (nightly, `next` channel)              | Strict static type checking (TypeScript 7)                      |
+| **Vite**          | `8.4.0-beta.1`                                       | Frontend dev server & production bundler (Vite 8)               |
+| **Cargo / Rust**  | `2024 edition`, MSRV 1.95 (Tauri 3)                  | Native system tray & background process backend                 |
+
+Newest published of everything, prereleases included — `bun run update` keeps it that way
+(see the routine in [`AGENTS.md`](AGENTS.md)). The table is the 0.28.0 snapshot.
 
 Every layer above has its **upstream documentation vendored locally** under
 `.docs/` — pinned to the branch that describes the version we actually run
-(`tauri-docs@v2`, `solid-docs@v2-rebuild`, `bun-docs@main`,
-`TypeScript-Website@v2`, `typescript-go@main`).
+(`tauri-docs@v2` for concepts plus `tauri@v3` and `plugins-workspace@v3` for the Tauri 3
+API, `solid-docs@v2-rebuild`, `bun-docs@main`, `TypeScript-Website@v2`, `typescript-go@main`).
 
 ```bash
 bun run docs:sync                  # clone/refresh every mirror (~200 MB, gitignored)
@@ -586,7 +591,8 @@ bun run docs:find "capabilities"   # search all mirrors at once
 ```
 
 Read the mirror before answering an architecture question — Solid 1.x and Solid 2
-are different runtimes, Tauri 1 and 2 have different security models, and
+are different runtimes, Tauri 1 and 2 have different security models, Tauri 3 moved
+the runtime into its own crate, and
 TypeScript 7 changed defaults that older tutorials assume. See
 [`DOCUMENTATION.md`](DOCUMENTATION.md) for the full reading map.
 
@@ -639,7 +645,7 @@ Minimalistic_App/
 │   ├── App.tsx                   # Application shell: tabs, header, footer, status bar
 │   ├── main.tsx                  # SolidJS 2 entry point (render, hardening, HMR dispose)
 │   └── index.css                 # AMOLED black design system (design tokens, glassmorphism)
-├── src-tauri/                    # Rust backend (Tauri 2)
+├── src-tauri/                    # Rust backend (Tauri 3 alpha)
 │   ├── src/main.rs               # Process entry: subsystem, Linux graphics fix, CLI parse
 │   ├── src/lib.rs                # Tray, IPC commands, window lifecycle, settings persistence
 │   ├── src/cli.rs                # Flag parsing + forwarding a second launch to the first
@@ -652,7 +658,7 @@ Minimalistic_App/
 │   ├── src/settings_migrate.rs   # Versioned schema migration ladder (runs before repair)
 │   ├── src/global_hotkeys.rs     # Binding registry, listener supervision, action dispatch
 │   ├── src/hotkeys/              # Hand-written OS keyboard-hook engine (win/mac/linux)
-│   ├── capabilities/default.json # Tauri v2 capability permissions
+│   ├── capabilities/default.json # Tauri capability permissions
 │   ├── Cargo.toml                # Rust manifest (version synced by before-commit.ts)
 │   ├── build.rs                  # tauri-build bootstrap
 │   ├── icons/                    # Generated icon set (PNG/ICO/ICNS — `bun run create-icons`)
@@ -729,7 +735,7 @@ derived at runtime from `package_info()`, so it follows automatically.
    - Add `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` repository secrets.
    - Push a `v*` tag to trigger `.github/workflows/release.yml`.
 4. **Replace the placeholder copy** — the highlights list in `AboutTab.tsx` and this README.
-5. **Validate & regenerate the docs** — `bun run validate` runs all 10 gates and refreshes `ARCHITECTURE.md`.
+5. **Validate & regenerate the docs** — `bun run validate` runs all 11 gates and refreshes `ARCHITECTURE.md`.
 
 > Renaming by hand instead? The identifiers live in exactly the files in the
 > table above — `src/lib/appMeta.ts` is the only place the frontend hardcodes
@@ -742,7 +748,7 @@ derived at runtime from `package_info()`, so it follows automatically.
 | Symptom                                              | Fix                                                                                                                                                                                                                               |
 | :--------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | App quits when closing the window                    | That's the default (`minimize_to_tray: false`). Enable the toggle in Preferences.                                                                                                                                                 |
-| No tray icon on Linux                                | System tray requires `libayatana-appindicator3-dev` + `libxdo-dev` (and a tray-supporting desktop shell). CI installs them for Ubuntu.                                                                                            |
+| No tray icon on Linux                                | Tauri 3 draws the tray through **ksni** (StatusNotifierItem over D-Bus), so no `libayatana-appindicator` package is needed any more — but the desktop shell must host SNI items (stock GNOME needs the AppIndicator extension).   |
 | Devtools not opening                                 | Devtools are compiled out of release builds (Tauri's default; enable the `devtools` Cargo feature to ship them). Under `bun run tauri dev` the hardening is off, so right-click → Inspect, `F12` or `Ctrl+Shift+I` all open them. |
 | "Update endpoint not found (GitHub release pending)" | No release published yet, or `endpoints` URL doesn't match your repo. Publish a tag via the release workflow.                                                                                                                     |
 | Version mismatch between files                       | Run `bun run before-commit` (sync) or `--check` (diagnose). CI blocks drifted pushes.                                                                                                                                             |
@@ -754,7 +760,7 @@ derived at runtime from `package_info()`, so it follows automatically.
 
 ## 📄 Documentation Links
 
-- [`DOCUMENTATION.md`](DOCUMENTATION.md) — **Start here for any stack question.** Where the vendored upstream docs for Tauri 2, SolidJS 2, Bun and TypeScript live locally, and which file to read for which question.
+- [`DOCUMENTATION.md`](DOCUMENTATION.md) — **Start here for any stack question.** Where the vendored upstream docs for Tauri (v2 guides + v3 source), SolidJS 2, Bun and TypeScript live locally, and which file to read for which question.
 - [`TYPESCRIPT-7.md`](TYPESCRIPT-7.md) — TypeScript 7 changed defaults, removals, behavioural diffs, and this repo's compliance audit.
 - [`BUILD.md`](BUILD.md) — Cross-platform build instructions, prerequisites & troubleshooting.
 - [`TESTING.md`](TESTING.md) — Testing & QA guide: 7-step automated gates and manual desktop verification matrix.

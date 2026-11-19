@@ -1,20 +1,22 @@
+// scripts/update-rtk.ts
+//
+// Reinstalls the `rtk` CLI (the command proxy the maintainer's agent hook
+// routes every shell command through), so `rtk` itself is tracked like any
+// other dependency. Tooling for the agent, not part of the application: it
+// touches nothing under `src/` or `src-tauri/`, and `bun run update` runs it
+// first because a stale proxy makes every later step's output the wrong shape.
+
 import { execSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 
 /**
- * Reinstalls the `rtk` CLI at the ABSOLUTE LATEST GitHub release tag — always.
+ * Reinstalls the `rtk` CLI at the ABSOLUTE LATEST GitHub commit or release tag.
  *
- * `cargo install` cannot reliably target a specific release unless `--tag` is
- * supplied, and crates.io usually lags behind the GitHub releases. So this
- * script queries the GitHub releases API (the same data that backs the
- * releases page), pages through every release, and sorts the tag names with
- * full SemVer precedence (including prerelease identifiers such as
- * `dev-0.45.1-rc.356`) to find the absolute newest tag — never relying on
- * GitHub's inherently unreliable tag/release ordering.
- *
- *   bun run update:rtk [--tag <tag>] [--check]
+ *   bun run update:rtk [--commit] [--tag <tag>] [--check]
  *
  * Flags:
- *   --tag <tag>   Pin an exact tag instead of fetching the latest (mostly for debugging).
+ *   --commit      Install directly from the latest commit on the default branch (HEAD).
+ *   --tag <tag>   Pin an exact tag instead of fetching the latest.
  *   --check       Resolve and print the latest tag, then exit without installing.
  *   --help, -h    Show usage.
  */
@@ -22,11 +24,29 @@ const REPO = 'rtk-ai/rtk';
 const RELEASES_URL = `https://api.github.com/repos/${REPO}/releases`;
 const TAGS_URL = `https://api.github.com/repos/${REPO}/tags`;
 const GIT_URL = `https://github.com/${REPO}`;
+// The repository holds more than one binary package (`rtk` and, since the
+// dev-1.2.1 line, `rtk-proxy`), and `cargo install --git` then refuses to
+// guess: the package is named explicitly.
+const PACKAGE = 'rtk';
 const PER_PAGE = 100;
+
+/**
+ * The npm package name, for the GitHub API User-Agent (GitHub rejects requests
+ * without one). Read from package.json so a `rename-project` rebrand renames
+ * the client too.
+ */
+const PACKAGE_SLUG: string = (() => {
+  try {
+    const name = (JSON.parse(readFileSync('package.json', 'utf8')) as { name?: unknown }).name;
+    return typeof name === 'string' && name.length > 0 ? name : 'tauri-app';
+  } catch {
+    return 'tauri-app';
+  }
+})();
 
 const API_HEADERS: Record<string, string> = {
   Accept: 'application/vnd.github+json',
-  'User-Agent': 'minimalistic-app-rtk-updater',
+  'User-Agent': `${PACKAGE_SLUG}-rtk-updater`,
 };
 
 interface SemverParts {
@@ -54,7 +74,13 @@ function parseSemver(tag: string): SemverParts | null {
   const minor = Number(parts[1]);
   const patch = Number(parts[2]);
   if (!Number.isInteger(major) || !Number.isInteger(minor) || !Number.isInteger(patch)) return null;
-  return { major, minor, patch, prerelease: prerelease ? prerelease.split('.') : [], raw: tag };
+  return {
+    major,
+    minor,
+    patch,
+    prerelease: prerelease ? prerelease.split('.') : [],
+    raw: tag,
+  };
 }
 
 /** Compares two identifiers per SemVer: numeric identifiers compare numerically and sort below alphanumeric ones. */
@@ -108,8 +134,7 @@ function absoluteLatestOf(tags: string[]): string | null {
 
 /**
  * Pages through a GitHub list endpoint (follows the `Link: rel="next"` header)
- * until exhausted. Recursive rather than a loop so the strictly-sequential
- * fetch chain stays lint-clean (`no-await-in-loop`).
+ * until exhausted.
  */
 async function fetchAllPages(url: string): Promise<Array<Record<string, unknown>>> {
   const res = await fetch(url, { headers: API_HEADERS });
@@ -129,8 +154,7 @@ async function fetchAllPages(url: string): Promise<Array<Record<string, unknown>
 /**
  * Resolves the absolute latest tag. Primary source: the releases API (the
  * same data as the GitHub releases page, drafts excluded). Fallback: the tags
- * API. Either way the result is SemVer-sorted, so the answer is always the
- * absolute newest tag — dev/pre-release builds included.
+ * API.
  */
 async function fetchLatestTag(): Promise<string> {
   try {
@@ -156,6 +180,7 @@ async function fetchLatestTag(): Promise<string> {
 
 interface Flags {
   tag?: string;
+  commit?: boolean;
   check?: boolean;
   help?: boolean;
 }
@@ -172,6 +197,9 @@ function parseFlags(args: string[]): Flags {
       case '--check':
         out.check = true;
         break;
+      case '--commit':
+        out.commit = true;
+        break;
       case '--tag': {
         const value = args[i + 1];
         if (!value) {
@@ -187,30 +215,37 @@ function parseFlags(args: string[]): Flags {
 }
 
 const HELP_TEXT = `
-Usage: bun run update:rtk [--tag <tag>] [--check]
+Usage: bun run update:rtk [--commit] [--tag <tag>] [--check]
 
-Reinstalls RTK at the ABSOLUTE LATEST GitHub release tag:
-  cargo install --git ${GIT_URL} --tag <tag> --force
-
-The latest tag is auto-detected from the GitHub releases API (paged through
-fully) and sorted with true SemVer precedence — the absolute newest tag wins,
-including dev/pre-release builds like dev-0.45.1-rc.356. Never relies on
-GitHub's tag/release array ordering.
+Reinstalls RTK at the ABSOLUTE LATEST GitHub release tag or commit:
+  cargo install --git ${GIT_URL} ${PACKAGE} [--tag <tag>] --force
 
 Flags:
+  --commit      Install from the latest git commit on default branch (HEAD).
   --tag <tag>   Pin an exact tag instead of fetching the latest.
   --check       Resolve and print the latest tag, then exit without installing.
   --help, -h    Show this usage.
 `;
 
-const flags = parseFlags(process.argv.slice(2));
-
-if (flags.help) {
-  console.log(HELP_TEXT);
-  process.exit(0);
-}
-
 const run = async (): Promise<void> => {
+  // Parsed inside run() so a bad flag reports through the same catch as every
+  // other failure.
+  const flags = parseFlags(process.argv.slice(2));
+
+  if (flags.help) {
+    console.log(HELP_TEXT);
+    return;
+  }
+
+  if (flags.commit) {
+    console.log(`Reinstalling RTK from the latest git commit (HEAD)...`);
+    execSync(`cargo install --git ${GIT_URL} ${PACKAGE} --force`, {
+      stdio: 'inherit',
+    });
+    console.log(`\nRTK updated to latest git commit.`);
+    return;
+  }
+
   const tag = flags.tag ?? (await fetchLatestTag());
 
   if (!/^[\w.-]+$/.test(tag)) {
@@ -223,7 +258,7 @@ const run = async (): Promise<void> => {
   }
 
   console.log(`Reinstalling RTK at tag ${tag}...`);
-  execSync(`cargo install --git ${GIT_URL} --tag ${tag} --force`, {
+  execSync(`cargo install --git ${GIT_URL} ${PACKAGE} --tag ${tag} --force`, {
     stdio: 'inherit',
   });
   console.log(`\nRTK updated to ${tag}.`);

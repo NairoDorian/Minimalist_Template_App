@@ -69,6 +69,27 @@ export const UpdateChecker: Component<UpdateCheckerProps> = (props) => {
   let isCheckingGuard = false;
   let isInstallingGuard = false;
 
+  /**
+   * Replaces the cached update, releasing the one it supersedes.
+   *
+   * An `Update` is not plain data: it extends the API's `Resource`, so every
+   * non-null `check()` result owns an entry in the backend's resource table
+   * until `close()` is called. Overwriting or nulling `pendingUpdate` without
+   * closing it leaked one entry per manual re-check, per failed check and per
+   * unmount of the Preferences card — small, but unbounded over a session that
+   * leaves the app in the tray for weeks. Closing is fire-and-forget: a failure
+   * to release a handle is not something the user can act on.
+   */
+  const replacePendingUpdate = (next: Update | null) => {
+    const previous = pendingUpdate;
+    pendingUpdate = next;
+    if (previous && previous !== next) {
+      previous.close().catch((err: unknown) => {
+        console.warn('Failed to release a superseded update handle:', err);
+      });
+    }
+  };
+
   /** Checks GitHub Releases for a newer version. */
   const checkForUpdates = async (isManual = false) => {
     if (!isTauri || isCheckingGuard || isInstallingGuard) return;
@@ -79,10 +100,12 @@ export const UpdateChecker: Component<UpdateCheckerProps> = (props) => {
     props.onStatusChange?.('Checking for updates...');
 
     try {
+      // Updater v3 removed `Update.available` (it was always `true`): a
+      // non-null result *is* the "an update exists" answer.
       const update = await check();
 
-      if (update?.available) {
-        pendingUpdate = update;
+      if (update) {
+        replacePendingUpdate(update);
         setLatestVersion(update.version);
         setReleaseNotes(update.body || null);
         setUpdateAvailable(true);
@@ -91,7 +114,7 @@ export const UpdateChecker: Component<UpdateCheckerProps> = (props) => {
         props.onStatusChange?.(`New version v${update.version} available!`);
         void notifyIfHidden(update.version);
       } else {
-        pendingUpdate = null;
+        replacePendingUpdate(null);
         setUpdateAvailable(false);
         setReleaseNotes(null);
         setShowNotes(false);
@@ -110,7 +133,11 @@ export const UpdateChecker: Component<UpdateCheckerProps> = (props) => {
       }
     } catch (error: unknown) {
       console.error('Failed to check for updates:', error);
-      pendingUpdate = null;
+      // An update found by an earlier check stays offered: a failed re-check
+      // (a network blip) says nothing about whether that release still exists,
+      // and keeping its handle keeps the Install button able to start at once.
+      // It used to be nulled here without `close()`, leaking the handle while
+      // the button stayed up and silently fell back to a fresh `check()`.
       const errStr = error instanceof Error ? error.message : String(error);
       if (errStr.includes('404') || errStr.includes('Could not fetch')) {
         setErrorMessage('Update endpoint not found (GitHub release pending)');
@@ -165,6 +192,10 @@ export const UpdateChecker: Component<UpdateCheckerProps> = (props) => {
         upToDateTimeout = null;
       }
       unlistenFn?.();
+      // The card unmounts with its tab. Its cached update handle goes with it —
+      // unless this instance is mid-install, where `installUpdate` still holds
+      // the same handle and closing it would cut the download off.
+      if (!isInstallingGuard) replacePendingUpdate(null);
     };
   });
 
@@ -183,17 +214,19 @@ export const UpdateChecker: Component<UpdateCheckerProps> = (props) => {
     props.onStatusChange?.('Starting update download...');
 
     try {
-      let update = pendingUpdate;
-      if (!update) {
-        update = await check();
-      }
+      const update = pendingUpdate ?? (await check());
 
-      if (!update?.available) {
+      if (!update) {
+        // Reached when the install button was showing but the cached handle had
+        // been dropped (a later check failed) and the re-check found nothing.
+        // Without clearing the flag the button stayed up, offering an install
+        // that could never start.
+        setUpdateAvailable(false);
         props.onStatusChange?.('No update found to install');
         return;
       }
 
-      pendingUpdate = update;
+      replacePendingUpdate(update);
       setLatestVersion(update.version);
       setReleaseNotes(update.body || null);
       setUpdateAvailable(true);

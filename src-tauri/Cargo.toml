@@ -1,6 +1,6 @@
 [package]
 name = "minimalistic-app"
-version = "0.27.0"
+version = "0.28.0"
 description = "Minimalistic cross-platform desktop application based on Tauri 2, Bun, SolidJS 2, and TypeScript"
 authors = ["Z"]
 edition = "2024"
@@ -15,30 +15,78 @@ name = "minimalistic_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "^2.6.3", features = [] }
+# ── The Tauri 3 family is pinned with `=`, and it moves as a SET ──────────────
+#
+# A prerelease requirement such as `3.0.0-alpha.4` reads as
+# `>=3.0.0-alpha.4, <3.0.0`, so a bare `cargo update` unifies the family forward
+# on its own — and a family split across two alphas resolves, then fails to
+# compile (or `tauri-build` rejects `tauri.conf.json` against a newer
+# `tauri-utils` schema) with an error naming none of the crates to look at. The
+# alphas carry their breaking changes in the prerelease position (alpha.3 moved
+# `run_on_main_thread` onto the `Manager` trait; alpha.4 removed the
+# `macos-private-api` feature), so "close enough" is not a version.
+#
+# Current set (2026-11-19, the newest published, the set ZER0 verified on
+# 2026-11-15): `tauri` / `tauri-runtime-wry` alpha.6, `tauri-runtime` alpha.5,
+# `tauri-build` / `tauri-codegen` / `tauri-utils` / `tauri-macros` /
+# `tauri-plugin` alpha.4. `@tauri-apps/cli` in package.json is the SAME release
+# as `tauri` (it validates tauri.conf.json before cargo runs).
+#
+# To move the set: bump every `=` here and in `[dependencies]` in one edit, then
+# `@tauri-apps/cli`. `scripts/update-deps.ts` never moves it for you
+# (`CARGO_VERSION_LOCKED`) — a new alpha is a reviewed change, not a refresh.
+tauri-build = { version = "=3.0.0-alpha.4", features = [] }
+# Pulled by tauri-build; declared only so the `=` has somewhere to live.
+tauri-codegen = "=3.0.0-alpha.4"
 
 [dependencies]
-tauri = { version = "^2.11.5", features = ["tray-icon", "specta"] }
-tauri-plugin-autostart = "^2.5.1"
-tauri-plugin-log = "^2.9.0"
-tauri-plugin-notification = "^2.3.3"
-tauri-plugin-process = "^2.3.1"
-tauri-plugin-single-instance = "^2.4.3"
-tauri-plugin-updater = "^2.10.1"
+# `specta` derives `specta::Type` for Tauri's own IPC types. Tauri 3 accepts
+# `specta ^2.0.0-rc.25`, so it unifies with the rc.28 below.
+tauri = { version = "=3.0.0-alpha.6", features = ["tray-icon", "specta"] }
+# In Tauri 3 the runtime is its own crate. `tauri::Builder::default()` is
+# generic over the type-erased `tauri::DynRuntime` and REFUSES to build until a
+# runtime is selected with `.runtime(tauri_runtime_wry::Wry::default())` (see
+# lib.rs). Its `Webview` type is also what `webview_hardening.rs` downcasts to
+# in order to reach the WebView2 controller.
+tauri-runtime-wry = "=3.0.0-alpha.6"
+# The rest of the family, declared ONLY to pin it. Nothing in this crate names
+# them: `tauri` pulls `tauri-runtime`, `tauri-utils` and `tauri-macros`, and
+# every plugin pulls `tauri-plugin`. A transitive requirement cannot carry an
+# `=`, so without these lines `cargo update` would split the family again.
+tauri-runtime = "=3.0.0-alpha.5"
+tauri-utils = "=3.0.0-alpha.4"
+tauri-macros = "=3.0.0-alpha.4"
+tauri-plugin = "=3.0.0-alpha.4"
+# Every plugin comes from Tauri's own `plugins-workspace`, `v3` branch — the
+# canonical source of the v3 plugins, tracked at the branch tip so `cargo
+# update` takes the newest v3 alpha (crates.io lags it). `Cargo.lock` pins the
+# commit; `bun run update` moves it. The `v3` tip requires
+# `tauri >= 3.0.0-alpha.4`, so plugins and core agree.
+tauri-plugin-autostart = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v3" }
+tauri-plugin-log = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v3" }
+tauri-plugin-notification = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v3" }
+tauri-plugin-process = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v3" }
+tauri-plugin-single-instance = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v3" }
+tauri-plugin-updater = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v3" }
 # log facade so backend diagnostics stream to tauri-plugin-log targets (stdout, file, webview)
-log = "^0.4.33"
+log = "^0.4.35"
 # serde with derive feature is used for AppSettings JSON persistence
 serde = { version = "^1.0.229", features = ["derive"] }
-serde_json = "^1.0.151"
+serde_json = "^1.0.154"
 # Reports the exact JSON path of a deserialization failure ("theme_accent",
 # "global_hotkeys[2].action") instead of a byte offset. That path is what lets
 # src/settings_repair.rs reset one broken field and keep every other setting,
 # rather than discarding the whole file. See its module docs.
 serde_path_to_error = "^0.1.20"
-# specta types + tauri-specta bindings: auto-generates type-safe Rust↔TypeScript IPC
-specta = { version = "=2.0.0-rc.25", features = ["derive", "function"] }
-specta-typescript = "=0.0.12"
-tauri-specta = { version = "=2.0.0-rc.25", features = ["typescript"] }
+# specta types + tauri-specta bindings: auto-generates type-safe Rust↔TypeScript IPC.
+# `specta` is held exactly: tauri-specta's fork requires `=2.0.0-rc.28`, and a
+# specta release candidate changes the generated bindings between rcs.
+specta = { version = "=2.0.0-rc.28", features = ["derive", "function"] }
+specta-typescript = "0.0.15"
+# Upstream tauri-specta publishes for Tauri 2 only (rc.29 requires `tauri ^2`).
+# The version here is what the manifest asks for; `[patch.crates-io]` below
+# swaps in the Tauri 3 fork of that same rc. See AGENTS.md § Tauri 3.
+tauri-specta = { version = "2.0.0-rc.29", features = ["derive", "typescript"] }
 
 # ── Global hotkey backends (src/hotkeys) ──────────────────────────────────────
 # OS keyboard-hook bindings for system-wide shortcuts. These are the only
@@ -47,7 +95,13 @@ tauri-specta = { version = "=2.0.0-rc.25", features = ["typescript"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Low-level keyboard hook (WH_KEYBOARD_LL) + session-change notifications.
-windows = { version = "0.58", features = [
+#
+# The SAME `windows` generation Tauri 3 links (wry 0.57 → windows 0.62). Until
+# 0.28.0 the hook pinned 0.58 while Tauri linked 0.61, so every build compiled
+# the largest crate in the graph twice; sharing one generation removes that
+# copy entirely. It moves when Tauri's moves — check `tauri-runtime-wry`'s
+# Cargo.toml before bumping.
+windows = { version = "^0.62.2", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -68,36 +122,49 @@ windows = { version = "0.58", features = [
 # *tauri's* `ICoreWebView2Controller`, so a version skew here is a type error,
 # not a runtime surprise. Check tauri's own Cargo.toml before bumping.
 #
-# Note these deliberately track a different `windows` generation than the
-# keyboard hook above (0.61 vs 0.58): the hook code is ours and pinned for
-# stability, while these must follow whatever Tauri links. Cargo builds both.
-webview2-com = "0.38"
-windows-core = "0.61"
+# Tauri 3 alpha.6 links webview2-com 0.39 and windows-core 0.62 (through wry
+# 0.57). `scripts/update-deps.ts` holds both on that line (`CARGO_MAJOR_LOCKED`):
+# crates.io carries a `windows-core 0.100`, a real version the COM cast would
+# not resolve against.
+webview2-com = "^0.39.1"
+windows-core = "0.62"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # CGEventTap-based tap; requires the Accessibility permission at runtime.
-objc2 = "0.6"
-objc2-core-foundation = "0.3"
-objc2-core-graphics = { version = "0.3", features = [
+objc2 = "^0.6.5"
+objc2-core-foundation = "^0.3.2"
+objc2-core-graphics = { version = "^0.3.2", features = [
     "CGEvent",
     "CGEventTypes",
     "CGEventSource",
     "CGRemoteOperation",
 ] }
-objc2-app-kit = { version = "0.3", features = ["NSEvent", "NSApplication"] }
-objc2-foundation = "0.3"
-block2 = "0.6"
+objc2-app-kit = { version = "^0.3.2", features = ["NSEvent", "NSApplication"] }
+objc2-foundation = "^0.3.2"
+block2 = "^0.6.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pure-Rust evdev bindings — no C build step, and identical behaviour on
 # Wayland, X11, and the console. uinput is used to re-inject non-blocked keys.
-evdev = "0.13"
-# poll(2) for the event loop and inotify(7) for device hotplug.
-libc = "0.2"
+evdev = "^0.13.2"
+# poll(2) for the event loop and inotify(7) for device hotplug. Stays on 0.2:
+# the 1.0.0-alpha.* tags are v1.0-branch snapshots and every other crate in the
+# graph depends on 0.2, so the alpha would only compile a second libc
+# (`CARGO_STABLE_ONLY` in scripts/update-deps.ts).
+libc = "^0.2.191"
 
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+# Upstream `specta-rs/tauri-specta` publishes for Tauri 2 only. The fork is
+# upstream rc.29 with the Tauri 3 adaptation on top (`tauri::Wry` → the core's
+# `tauri::DynRuntime`, Tauri 3 workspace pins, published Specta rc.28/0.0.15).
+# Its working copy is C:\Users\Z\Downloads\PROJECTS\tauri-specta-v3 — change
+# the fork THERE, push it, then `cargo update -p tauri-specta` here. Never
+# edit a copy under `target/` or `~/.cargo/git/checkouts`. See AGENTS.md § Tauri 3.
+[patch.crates-io]
+tauri-specta = { git = "https://github.com/NairoDorian/tauri-specta-v3" }
 
 [profile.dev]
 incremental = true

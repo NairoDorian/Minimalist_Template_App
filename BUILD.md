@@ -73,7 +73,6 @@ sudo apt install -y \
   libssl-dev \
   libgtk-3-dev \
   libwebkit2gtk-4.1-dev \
-  libayatana-appindicator3-dev \
   librsvg2-dev \
   patchelf \
   curl
@@ -85,7 +84,6 @@ sudo dnf install -y \
   openssl-devel \
   gtk3-devel \
   webkit2gtk4.1-devel \
-  libappindicator-gtk3-devel \
   librsvg2-devel \
   patchelf
 
@@ -95,7 +93,6 @@ sudo pacman -S --needed \
   openssl \
   gtk3 \
   webkit2gtk-4.1 \
-  libappindicator-gtk3 \
   librsvg \
   patchelf
 ```
@@ -124,7 +121,7 @@ The upstream docs for every layer of the stack are vendored into `.docs/`
 the exact versions this app runs:
 
 ```bash
-bun run docs:sync     # Tauri 2 (v2), SolidJS 2 (v2-rebuild), Bun, TypeScript, TypeScript 7
+bun run docs:sync     # Tauri guides (v2) + Tauri 3 core/plugins (v3), SolidJS 2, Bun, TypeScript, TS 7
 bun run docs:check    # verify what is present and how fresh it is
 ```
 
@@ -135,7 +132,7 @@ without it — but every doc-driven workflow in [`AGENTS.md`](AGENTS.md) and
 
 ### 4. Start Live Development Mode
 
-Launch both the Vite frontend server and Tauri 2 Rust application in live hot-reload development mode:
+Launch both the Vite frontend server and Tauri 3 Rust application in live hot-reload development mode:
 
 ```bash
 bun run tauri dev
@@ -243,7 +240,7 @@ bun run typecheck
 # 3. Check version synchronization across mirrors
 bun run before-commit --check
 
-# 4. Full pre-commit suite — all 10 gates (version, formatting, types, lint,
+# 4. Full pre-commit suite — all 11 gates (version, formatting, types, lint,
 #    Bun tests, Vite build, cargo check, clippy, cargo test, arch map)
 bun run validate
 ```
@@ -297,7 +294,7 @@ bun run kill
 
 ### Linux: `webkit2gtk-4.0` vs `webkit2gtk-4.1`
 
-Tauri 2 defaults to `webkit2gtk-4.1` (built against libsoup3). If you receive missing package errors on older Ubuntu versions (e.g. 20.04), install `libwebkit2gtk-4.0-dev` or upgrade to Ubuntu 22.04 LTS+.
+Tauri (2 and 3) defaults to `webkit2gtk-4.1` (built against libsoup3). If you receive missing package errors on older Ubuntu versions (e.g. 20.04), install `libwebkit2gtk-4.0-dev` or upgrade to Ubuntu 22.04 LTS+.
 
 ### macOS: App Translocation / Gatekeeper Warnings
 

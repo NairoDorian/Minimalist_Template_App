@@ -8,6 +8,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > [!NOTE]
 > **Release flow (exact order)**: `bun run before-commit --bump <major|minor|patch>` → add this version's entry at the top of this file → `bun run arch` → `bun run before-commit --check` + `bun run typecheck` → commit & push (`feat(vX.Y.Z): ...`). Bump levels: **patch** = fixes (`0.8.1 → 0.8.2`), **minor** = backward-compatible features (`0.8.1 → 0.9.0`), **major** = breaking changes (`0.8.1 → 1.0.0`). Full walkthrough: `README.md` / `AGENTS.md`.
 
+## [0.28.0] - 2026-11-19
+
+### Round 28 — Tauri 3, Newest-of-Everything, and ZER0's Tooling Ported Back
+
+The template moves onto the stack its production sibling ZER0
+(`Handy_V2`) has run since the autumn — the **Tauri 3 alpha** and stable
+**Solid 2** — adopts ZER0's dependency routine and notes, and fixes the bugs a
+full audit turned up along the way.
+
+#### 🧱 Tauri 3 (alpha)
+
+- **The whole Tauri family is pinned with `=` and moves as one set**:
+  `tauri` / `tauri-runtime-wry` `3.0.0-alpha.6`, `tauri-runtime` alpha.5,
+  `tauri-build` / `tauri-codegen` / `tauri-utils` / `tauri-macros` /
+  `tauri-plugin` alpha.4 (the set ZER0 verified; still the newest published),
+  with `@tauri-apps/cli` `3.0.0-alpha.6`. Five of those crates are declared only
+  so the `=` has somewhere to live — see AGENTS.md § Tauri 3.
+- **Plugins** (autostart, log, notification, process, single-instance, updater)
+  come from `tauri-apps/plugins-workspace`, branch `v3`; the JS halves are
+  `3.0.0-alpha.3`. **Bindings**: `tauri-specta` rc.29 through the
+  `NairoDorian/tauri-specta-v3` fork (`[patch.crates-io]`), specta `=2.0.0-rc.28`,
+  specta-typescript 0.0.15.
+- **Code changes the alpha required**: the runtime is selected explicitly
+  (`.runtime(tauri_runtime_wry::Wry::default())`); the specta builder is typed on
+  `tauri::DynRuntime` (`tauri::Wry` is gone); WebView2 hardening reaches the
+  controller by downcasting to `tauri_runtime_wry::Webview`; `app.autolaunch()`
+  → `app.autostart()`; the updater's `Update.available` is gone (a non-null
+  `check()` is the answer); `tauri.conf.json` uses the v3 schema.
+- **Regenerated `src/bindings.ts`**: specta rc.28 emits phase-split types for
+  structs with serde defaults (`AppSettings_Serialize` / `_Deserialize`) and an
+  optional `InvokeOptions` on every command. The frontend type-checks unchanged.
+- **One `windows` crate instead of two.** The keyboard hook moved from
+  `windows 0.58` to the 0.62 Tauri 3 links (and `webview2-com` 0.38 → 0.39,
+  `windows-core` 0.61 → 0.62), so the largest crate in the graph is compiled
+  once. The hook code compiled unchanged.
+- **Linux tray uses ksni** (StatusNotifierItem over D-Bus): the
+  `libayatana-appindicator` system package is gone from BUILD.md and both
+  workflows. MSRV is now 1.95.
+
+#### ⬆️ Every other dependency to its newest version
+
+- **Solid 2 went stable**: `solid-js` / `@solidjs/web` `2.0.0-rc.1` → **2.0.3**,
+  `@solidjs/vite-plugin` 3.0.0-next.31 → **3.0.1**. TypeScript
+  `7.1.0-dev.20261119.1`, Vite `8.4.0-beta.1`, oxlint 1.94.0, repomix 1.19.0,
+  `@types/node` 26.6.6, `bun-types` 1.4.5 canary; Cargo `log` 0.4.35,
+  `serde_json` 1.0.154, `objc2` 0.6.5, `evdev` 0.13.2, `libc` 0.2.191 and the rest.
+  Prettier stays on its newest, `4.0.0-alpha.13`.
+- **GitHub Actions**: `actions/checkout` v4 → **v7**, `actions/github-script`
+  v7 → **v9**, `tauri-apps/tauri-action` v0 → **v1** (its macOS updater archive
+  now carries the version, which AUTO-UPDATE.md's example already assumed).
+
+#### 🔁 Tooling ported from ZER0
+
+- **`scripts/update-deps.ts` replaced by ZER0's evolution of it** (which began as
+  this template's script): `=`-family holds (`CARGO_VERSION_LOCKED`,
+  `NPM_VERSION_LOCKED`), COM-instance ceilings for `webview2-com` /
+  `windows-core` (plus `windows` for the hook), Solid major guards, a query
+  deadline, cargo conflict detection that holds the culprit and retries, a
+  transitive "behind latest" audit, and a deduplicated hold report. New here: the
+  **GitHub Actions audit** ZER0's header promised but never shipped, a crates.io
+  User-Agent derived from `package.json`, and step 7 checking **both** cargo
+  profiles.
+- **`bun run update`** (`scripts/update-all.ts`): rtk → `update-deps --prerelease`
+  → `arch`. **`bun run routine`**: that, then the full gate.
+- **`scripts/update-rtk.ts`** names the `rtk` package explicitly (the RTK repo now
+  ships two binaries and `cargo install --git` refused to guess) and gained
+  `--commit`.
+- **AGENTS.md** gained ZER0's routine and Tauri-family rules.
+
+#### 🐞 Fixed
+
+- **A version bump no longer re-resolves the whole lockfile.** `before-commit`
+  ran `cargo generate-lockfile`, which re-resolved every crate (the 0.27.0 bump
+  rewrote ~100 entries) and would now also have moved the git-tracked plugins.
+  It stamps the root crate's own `[[package]]` block instead (ZER0's
+  technique); this release's bump changed exactly one line of `Cargo.lock`.
+- **Reset to factory defaults left the old hotkeys firing and the login entry
+  registered** until restart — `reset_app_settings` and `update_app_settings`
+  stopped at the file. A shared `apply_settings_side_effects` now rebuilds the
+  hotkey listener and reconciles autostart when those fields change. Restoring a
+  backup had the same gap.
+- **Whole-struct settings writes bypassed the hotkey invariants.** A restored
+  backup could persist one chord bound to two actions, and since the migration
+  only runs for older schema versions, nothing ever repaired it.
+  `normalize_bindings` (keep-first, canonical comparison, so `ctrl+alt+a` and
+  `Ctrl+Alt+A` are one chord) now runs on every whole-struct write, which also
+  stamps the current schema version.
+- **Settings writes were not crash-safe as documented.** The temp file is now
+  `fsync`ed before the rename, and the fallback that **deleted `settings.json`
+  before retrying a failed rename** (losing it if the retry failed too) now
+  retries with backoff and moves the old file aside, restoring it on failure.
+- **Leaked updater handles.** Every non-null `check()` result is a backend
+  resource; superseded and unmounted ones were dropped without `close()`. A
+  failed re-check also no longer discards an update already found, and an
+  install that finds nothing clears the stale Install button.
+- **The release workflow broke on any backtick in the changelog**: the notes were
+  spliced into a JavaScript template literal. They now pass through `env`
+  (which also closes the expression-injection pattern). `rename-project` follows
+  the new line shape.
+- **CI never compiled the release-only WebView2 hardening** — the exact skew
+  AGENTS.md warned about would have shipped green. CI (Windows), `bun run
+validate` (now 11 gates) and `update-deps` run `cargo check --release`.
+- **`docs:sync` aborted every mirror after one failure**, and the
+  `typescript-go` entry listed files in a cone-mode sparse set, which current
+  git rejects. Each source is now isolated and reported.
+- **Every dev launch logged a WARN about autostart** even with nothing to
+  reconcile; the no-op case is skipped in every build now.
+- oxlint is at zero warnings (three `consistent-function-scoping` hoists).
+
+#### 📚 Documentation
+
+- Two new mirrors: **`tauri-v3`** (`tauri-apps/tauri@v3` — `.changes/` is the v3
+  migration guide; `crates/tauri`, `crates/tauri-runtime-wry`) and
+  **`tauri-plugins-v3`** (the six plugins the app links). DOCUMENTATION.md
+  orders them: v3 source first, v2 guides for unchanged concepts.
+- README, BUILD, TESTING, SECURITY, AUTO-UPDATE, CONTRIBUTING and CRUSH updated
+  for Tauri 3, the 11-gate suite and the routine.
+
 ## [0.27.0] - 2026-09-09
 
 ### Round 27 — Full Review: Correctness Fixes, Notification Service, Gate Parity, Documentation Truth

@@ -100,16 +100,17 @@ export function DeveloperTab(props: DeveloperTabProps) {
   /** Timer that expires the two-step reset confirmation. */
   let resetConfirmTimeout: ReturnType<typeof setTimeout> | null = null;
 
+  /** Keeps the viewport readout current while the panel is mounted. */
+  const handleResize = () => {
+    setViewport({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      pixelRatio: window.devicePixelRatio,
+    });
+  };
+
   onSettled(() => {
     void checkNotificationPermission().then(setNotifPermission);
-
-    const handleResize = () => {
-      setViewport({
-        width: window.innerWidth,
-        height: window.innerHeight,
-        pixelRatio: window.devicePixelRatio,
-      });
-    };
     window.addEventListener('resize', handleResize);
     return () => {
       window.removeEventListener('resize', handleResize);

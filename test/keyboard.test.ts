@@ -480,17 +480,18 @@ describe('createKeyboardListener', () => {
   });
 });
 
-describe('hotkeyFromTrackedEvent', () => {
-  const tracked = (over: Partial<TrackedKeyEvent>): TrackedKeyEvent => ({
-    modifiers: MOD.NONE,
-    key: null,
-    char: '',
-    isKeyDown: true,
-    changedModifier: null,
-    domEvent: domEvent('KeyA', 'a'),
-    ...over,
-  });
+/** A tracked key event with neutral defaults, overridden per test. */
+const tracked = (over: Partial<TrackedKeyEvent>): TrackedKeyEvent => ({
+  modifiers: MOD.NONE,
+  key: null,
+  char: '',
+  isKeyDown: true,
+  changedModifier: null,
+  domEvent: domEvent('KeyA', 'a'),
+  ...over,
+});
 
+describe('hotkeyFromTrackedEvent', () => {
   it('builds a full hotkey once a real key is pressed', () => {
     const hotkey = hotkeyFromTrackedEvent(tracked({ modifiers: MOD.CTRL_LEFT, key: 'K' }));
     expect(hotkey).toEqual({ modifiers: MOD.CTRL_LEFT, key: 'K', matchOn: 'code' });

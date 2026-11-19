@@ -24,9 +24,12 @@ import { APP_VERSION } from './version';
  *                             5.  Frontend unit tests (bun test)
  *                             6.  Vite production bundle validation
  *                             7.  Rust Cargo compilation check (cargo check)
- *                             8.  Rust lint (cargo clippy -D warnings)
- *                             9.  Rust unit tests (cargo test)
- *                             10. Architecture map refresh (arch)
+ *                             8.  Release-profile compilation check (cargo check --release)
+ *                             9.  Rust lint (cargo clippy -D warnings)
+ *                             10. Rust unit tests (cargo test)
+ *                             11. Architecture map refresh (arch)
+ *   --routine                 `bun run update` (rtk + every dependency to its newest
+ *                             version, prereleases included, validated) and then --full.
  *   --stage                   Automatically stage synced mirror files with `git add`.
  *   --install-hook            Install `.git/hooks/pre-commit` running version check, format check,
  *                             lint, typecheck & unit tests.
@@ -38,7 +41,7 @@ import { APP_VERSION } from './version';
  *   - src-tauri/Cargo.toml      (package version)
  *   - src-tauri/tauri.conf.json (version field — drives the bundled artifact
  *                                and the auto-updater's latest.json feed)
- *   - src-tauri/Cargo.lock      (root crate entry, refreshed via `cargo generate-lockfile`)
+ *   - src-tauri/Cargo.lock      (the root crate's own block only — see refreshLockfileVersion)
  *
  * The frontend version (`__APP_VERSION__`, Vite `define`) derives from
  * `scripts/version.ts` directly at build time.
@@ -118,25 +121,88 @@ function readMirrorValue(mirror: VersionMirror): string | null {
   return content.match(mirror.pattern)?.[1] ?? null;
 }
 
-/** Returns the root crate version recorded in Cargo.lock, or null. */
-function readLockfileVersion(): string | null {
-  const lockPath = path.join(CARGO_MANIFEST_DIR, 'Cargo.lock');
-  if (!fs.existsSync(lockPath)) return null;
-  const content = fs.readFileSync(lockPath, 'utf8');
-  return (
-    content.match(new RegExp(`name = "${CARGO_CRATE_NAME}"\\r?\\nversion = "([^"]+)"`, 'm'))?.[1] ??
-    null
-  );
+const LOCK_PATH = path.join(CARGO_MANIFEST_DIR, 'Cargo.lock');
+
+/** One `[[package]]` block of `Cargo.lock`, as found by `splitLockBlocks`. */
+interface LockBlock {
+  /** Offset of the block's `[[package]]` header. */
+  start: number;
+  /** Offset just past the block's last line. */
+  end: number;
+  name: string;
+  version: string;
+  /** Whether the block carries a `source = "…"` line. */
+  sourced: boolean;
 }
 
-/** Refreshes the Cargo.lock root entry after a Cargo.toml version change. */
-function refreshLockfileVersion(): boolean {
-  const result = spawnSync('cargo', ['generate-lockfile'], {
-    cwd: CARGO_MANIFEST_DIR,
-    stdio: 'inherit',
-    shell: true,
+/** Splits `Cargo.lock` into its `[[package]]` blocks, in file order. */
+function splitLockBlocks(text: string): LockBlock[] {
+  const starts = [...text.matchAll(/^\[\[package\]\]\r?$/gm)].map((m) => m.index ?? 0);
+  const bounds = [...starts, text.length];
+  return starts.map((start, index) => {
+    const end = bounds[index + 1] ?? text.length;
+    const body = text.slice(start, end);
+    return {
+      start,
+      end,
+      name: body.match(/^name = "([^"]+)"/m)?.[1] ?? '',
+      version: body.match(/^version = "([^"]+)"/m)?.[1] ?? '',
+      sourced: /^source = "/m.test(body),
+    };
   });
-  return result.status === 0;
+}
+
+/**
+ * The workspace crate's own block: Cargo writes a `source` line for every
+ * package it fetched and none for the crate being built, so it is the one
+ * sourceless block carrying our name. Anything but exactly one match is
+ * treated as "not found" rather than guessed at.
+ */
+function findRootLockBlock(text: string): LockBlock | null {
+  const matches = splitLockBlocks(text).filter((b) => !b.sourced && b.name === CARGO_CRATE_NAME);
+  return matches.length === 1 ? (matches[0] ?? null) : null;
+}
+
+/** Returns the root crate version recorded in Cargo.lock, or null. */
+function readLockfileVersion(): string | null {
+  if (!fs.existsSync(LOCK_PATH)) return null;
+  return findRootLockBlock(fs.readFileSync(LOCK_PATH, 'utf8'))?.version ?? null;
+}
+
+/**
+ * Stamps `version` into the root crate's block of Cargo.lock — and touches
+ * nothing else.
+ *
+ * This used to run `cargo generate-lockfile`, which does not merely stamp the
+ * root crate: it re-resolves EVERY dependency to the newest version its spec
+ * allows (the 0.27.0 bump rewrote roughly a hundred crate entries). Since
+ * 0.28.0 that is worse than noisy: the Tauri plugins are git dependencies
+ * tracking `plugins-workspace`'s `v3` branch, so a version bump would also have
+ * moved the plugin commit — an unreviewed framework change hidden inside a
+ * "chore: bump version". Moving dependencies is `bun run update`'s job; this
+ * only edits the one block a version change actually changes. (The technique
+ * is ZER0's `syncLockRoot` in `scripts/app-meta.ts`.)
+ *
+ * `generate-lockfile` survives only as the fallback for a missing lockfile,
+ * where there is no resolution to preserve.
+ */
+function refreshLockfileVersion(version: string): boolean {
+  if (!fs.existsSync(LOCK_PATH)) {
+    const result = spawnSync('cargo', ['generate-lockfile'], {
+      cwd: CARGO_MANIFEST_DIR,
+      stdio: 'inherit',
+      shell: true,
+    });
+    return result.status === 0;
+  }
+  const text = fs.readFileSync(LOCK_PATH, 'utf8');
+  const block = findRootLockBlock(text);
+  if (!block) return false;
+  const stamped = text
+    .slice(block.start, block.end)
+    .replace(/^version = "[^"]+"/m, `version = "${version}"`);
+  fs.writeFileSync(LOCK_PATH, text.slice(0, block.start) + stamped + text.slice(block.end), 'utf8');
+  return true;
 }
 
 /** Validates SemVer format (e.g. 1.0.0 or 1.0.0-rc.1). */
@@ -312,6 +378,16 @@ function runFullPipeline(version: string): void {
       args: ['check', '--manifest-path', 'src-tauri/Cargo.toml'],
     },
     {
+      // The release profile compiles code the debug profile does not: the
+      // WebView2 hardening (`webview_hardening.rs`) is `not(debug_assertions)`
+      // and is where the `webview2-com` / `windows-core` / `tauri-runtime-wry`
+      // types meet. A version skew there passed every other gate and failed
+      // only `tauri build`. Cheap after the first run (no codegen).
+      name: 'Release-Profile Compilation Check (cargo check --release)',
+      cmd: 'cargo',
+      args: ['check', '--release', '--manifest-path', 'src-tauri/Cargo.toml'],
+    },
+    {
       // `-D warnings` makes this a real gate: the backend embeds the platform
       // keyboard hooks, where a clippy warning is worth reading, not ignoring.
       name: 'Rust Lint (cargo clippy)',
@@ -355,10 +431,37 @@ function runFullPipeline(version: string): void {
   console.log('=================================================================');
 }
 
+/**
+ * The whole routine, as one command: every dependency to its newest version
+ * (`bun run update` — rtk, then `update-deps --prerelease` with its own
+ * tsc + vite build + debug/release cargo check, then the architecture map),
+ * and then the full gate on the tree that left behind.
+ *
+ * Manual by design, never in the git hook: it reaches two registries and
+ * rewrites both lockfiles, and a dependency bump deserves its own commit. The
+ * update keeps its own validation rather than leaning on the gate's
+ * `typecheck`, because a dependency bump is exactly the change that needs the
+ * larger proof (a production build, both cargo profiles). Ported from ZER0's
+ * `precommit:routine`.
+ */
+function runRoutine(version: string): void {
+  console.log('=================================================================');
+  console.log('🔁 ROUTINE — dependencies to newest (validated), then the full gate');
+  console.log('=================================================================\n');
+  const { success, durationMs } = runCommand('Dependency update (bun run update)', 'bun', [
+    'run',
+    'update',
+  ]);
+  if (!success) fail('The dependency update failed — the gate was not run.');
+  console.log(`   └─ ✅ Completed in ${durationMs}ms\n`);
+  runFullPipeline(version);
+}
+
 /** Main execution function. */
 function run(): void {
   const args = process.argv.slice(2);
   const isCheck = args.includes('--check');
+  const isRoutine = args.includes('--routine');
   const isFull = args.includes('--full') || args.includes('--all') || args.includes('-f');
   const isInstallHook = args.includes('--install-hook');
   const isUninstallHook = args.includes('--uninstall-hook');
@@ -374,7 +477,8 @@ Professional Developer Pre-Commit Pipeline & Version Sync
 Usage:
   bun run before-commit                  Sync APP_VERSION into all mirror files
   bun run before-commit --check          Validate version mirrors (exit 1 on drift)
-  bun run before-commit --full           Run full verification: check + format + tsc + lint + bun test + vite + cargo check + clippy + cargo test + arch
+  bun run before-commit --full           Run full verification: check + format + tsc + lint + bun test + vite + cargo check (debug + release) + clippy + cargo test + arch
+  bun run before-commit --routine        bun run update (deps → newest, validated), then --full
   bun run before-commit --bump <part>    Increment semver (major | minor | patch) and sync
   bun run before-commit --set <version>  Set exact semver string and sync
   bun run before-commit --stage          Auto-stage touched mirror files with git add
@@ -405,6 +509,11 @@ Usage:
 
   if (!fs.existsSync(path.join(ROOT, 'package.json'))) {
     fail('package.json not found — run this script from the repository root.');
+  }
+
+  if (isRoutine) {
+    runRoutine(APP_VERSION);
+    return;
   }
 
   // Handle Full Validation Suite
@@ -470,11 +579,13 @@ Usage:
       );
       hasDrift = true;
     } else {
-      console.log(
-        ' 🔧 src-tauri/Cargo.lock  refreshing root crate entry (cargo generate-lockfile)...'
-      );
-      if (refreshLockfileVersion() && readLockfileVersion() === version) {
-        console.log(` ✅ src-tauri/Cargo.lock              ${version}  (refreshed)`);
+      // Counted as drift, so the summary below does not claim everything was
+      // "already in sync" right after rewriting the lockfile.
+      hasDrift = true;
+      if (refreshLockfileVersion(version) && readLockfileVersion() === version) {
+        console.log(
+          ` 🔧 ${'src-tauri/Cargo.lock'.padEnd(28)} ${currentLockVersion ?? '(absent)'}  →  ${version}  (root crate only)`
+        );
       } else {
         console.log(
           ' ⚠️  Cargo.lock not refreshed automatically — run `cargo check` in src-tauri/.'

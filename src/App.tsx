@@ -108,44 +108,49 @@ export function AppContent() {
     statusTimeout = setTimeout(() => setStatusMessage('Ready'), 4000);
   };
 
+  /**
+   * Global keyboard shortcuts, dispatched from the APP_SHORTCUTS registry so the
+   * cheat-sheet modal always documents exactly what the app listens for.
+   * Defined at component scope (it closes over this component's setters, not
+   * over anything `onSettled` creates), so the lifecycle block below is only
+   * the subscription and its teardown.
+   */
+  const handleGlobalKeyDown = (e: KeyboardEvent) => {
+    // A hotkey recorder is armed — the chord being bound must not also fire
+    // whatever it is currently bound to.
+    if (isCapturingHotkey()) return;
+
+    const action = resolveShortcutAction(e);
+    // `Escape` is owned by whichever modal is open (see KeyboardShortcutsModal).
+    if (action === null || action === 'close-modal') return;
+
+    // Un-modified shortcuts (e.g. `?`) must never steal keystrokes from a field.
+    const isUnmodified = !e.ctrlKey && !e.metaKey;
+    if (isUnmodified && isTextEntryTarget(e.target)) return;
+
+    e.preventDefault();
+    switch (action) {
+      case 'tab-preferences':
+        setActiveTab('preferences');
+        break;
+      case 'tab-about':
+        setActiveTab('about');
+        break;
+      case 'tab-developer':
+        setActiveTab('developer');
+        break;
+      case 'toggle-shortcuts':
+        setShortcutsModalOpen((prev) => !prev);
+        break;
+    }
+  };
+
   // Component setup + teardown in one block — the SolidJS 2 lifecycle shape
   // (`onSettled` returning a cleanup replaces the 1.x `onMount` + `onCleanup`
   // pairing; `onCleanup` is now reserved for library/custom-primitive internals).
-  //
-  // Registers the global keyboard shortcuts, dispatched from the APP_SHORTCUTS
-  // registry so the cheat-sheet modal always documents exactly what the app
-  // listens for, and disarms the pending status-message timer on disposal.
+  // Subscribes the shortcut handler above and disarms the pending
+  // status-message timer on disposal.
   onSettled(() => {
-    const handleGlobalKeyDown = (e: KeyboardEvent) => {
-      // A hotkey recorder is armed — the chord being bound must not also fire
-      // whatever it is currently bound to.
-      if (isCapturingHotkey()) return;
-
-      const action = resolveShortcutAction(e);
-      // `Escape` is owned by whichever modal is open (see KeyboardShortcutsModal).
-      if (action === null || action === 'close-modal') return;
-
-      // Un-modified shortcuts (e.g. `?`) must never steal keystrokes from a field.
-      const isUnmodified = !e.ctrlKey && !e.metaKey;
-      if (isUnmodified && isTextEntryTarget(e.target)) return;
-
-      e.preventDefault();
-      switch (action) {
-        case 'tab-preferences':
-          setActiveTab('preferences');
-          break;
-        case 'tab-about':
-          setActiveTab('about');
-          break;
-        case 'tab-developer':
-          setActiveTab('developer');
-          break;
-        case 'toggle-shortcuts':
-          setShortcutsModalOpen((prev) => !prev);
-          break;
-      }
-    };
-
     window.addEventListener('keydown', handleGlobalKeyDown);
     return () => {
       window.removeEventListener('keydown', handleGlobalKeyDown);

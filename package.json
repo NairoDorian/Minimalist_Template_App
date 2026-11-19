@@ -1,7 +1,7 @@
 {
   "name": "minimalistic-app",
   "private": true,
-  "version": "0.27.0",
+  "version": "0.28.0",
   "type": "module",
   "scripts": {
     "vite": "vite",
@@ -16,12 +16,14 @@
     "rename-project": "bun scripts/rename-project.ts",
     "before-commit": "bun scripts/before-commit.ts",
     "validate": "bun scripts/before-commit.ts --full",
+    "routine": "bun scripts/before-commit.ts --routine",
     "arch": "bun scripts/generate-arch.ts",
     "docs:sync": "bun scripts/sync-docs.ts",
     "docs:check": "bun scripts/sync-docs.ts --check",
     "docs:find": "bun scripts/sync-docs.ts --find",
     "create-icons": "bun scripts/create-icons.ts",
     "update-deps": "bun scripts/update-deps.ts",
+    "update": "bun scripts/update-all.ts",
     "update:rtk": "bun scripts/update-rtk.ts",
     "format": "prettier --write . && cd src-tauri && cargo fmt",
     "format:check": "prettier --check . && cd src-tauri && cargo fmt -- --check",
@@ -31,22 +33,22 @@
     "clean": "cargo clean --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {
-    "@solidjs/web": "2.0.0-rc.1",
-    "@tauri-apps/api": "^2.11.1",
-    "@tauri-apps/plugin-notification": "^2.3.3",
-    "@tauri-apps/plugin-process": "^2.3.1",
-    "@tauri-apps/plugin-updater": "^2.10.1",
-    "solid-js": "2.0.0-rc.1"
+    "@solidjs/web": "2.0.3",
+    "@tauri-apps/api": "3.0.0-alpha.3",
+    "@tauri-apps/plugin-notification": "3.0.0-alpha.3",
+    "@tauri-apps/plugin-process": "3.0.0-alpha.3",
+    "@tauri-apps/plugin-updater": "3.0.0-alpha.3",
+    "solid-js": "2.0.3"
   },
   "devDependencies": {
-    "@solidjs/vite-plugin": "3.0.0-next.31",
-    "@tauri-apps/cli": "^2.11.4",
-    "@types/node": "26.2.0",
-    "bun-types": "1.4.0-canary.20260820T142103",
-    "oxlint": "1.79.0",
+    "@solidjs/vite-plugin": "3.0.1",
+    "@tauri-apps/cli": "3.0.0-alpha.6",
+    "@types/node": "26.6.6",
+    "bun-types": "1.4.5-canary.20261119T141227",
+    "oxlint": "1.94.0",
     "prettier": "4.0.0-alpha.13",
-    "repomix": "1.18.0",
-    "typescript": "7.1.0-dev.20260819.1",
-    "vite": "8.2.2"
+    "repomix": "1.19.0",
+    "typescript": "7.1.0-dev.20261119.1",
+    "vite": "8.4.0-beta.1"
   }
 }

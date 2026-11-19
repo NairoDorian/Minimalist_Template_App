@@ -31,7 +31,7 @@ bun run format:check
 # 5. Version Synchronization Validation (Mirror drift check)
 bun run before-commit --check
 
-# 6. Refresh the local documentation mirrors (Tauri 2 / SolidJS 2 / Bun / TypeScript)
+# 6. Refresh the local documentation mirrors (Tauri v2 guides + v3 source / SolidJS 2 / Bun / TypeScript)
 bun run docs:sync
 bun run docs:check
 
@@ -55,9 +55,9 @@ bun run tauri dev
 > `bun run validate` and the CI workflow both invoke `bun run test`, so they are
 > already correct; only an ad-hoc `bun test` in a terminal is a trap.
 
-## 🛡️ The 10-Gate Pre-Commit Quality Suite (`bun run validate`)
+## 🛡️ The 11-Gate Pre-Commit Quality Suite (`bun run validate`)
 
-The automated validation pipeline runs 10 gates sequentially, ordered cheapest-first
+The automated validation pipeline runs 11 gates sequentially, ordered cheapest-first
 so a broken build fails fast (a few seconds warm, plus the Rust compile). It is the
 same set of checks `.github/workflows/ci.yml` runs, so a green `validate` is a
 green push:
@@ -81,10 +81,11 @@ graph TD
 4. **Code Lint Gate**: Runs oxlint (TS7-compatible) with correctness/suspicious/perf categories plus unicorn, typescript, and import plugin rules.
 5. **Frontend Unit Test Gate**: Runs every `test/*.test.ts` file through Bun's built-in runner, against Solid's client build.
 6. **Vite Production Build Gate**: Compiles the production frontend bundle into `dist/` to catch bundler, CSS token, or asset resolution issues.
-7. **Rust Cargo Compilation Gate**: Verifies backend compilation against Tauri v2 and OS APIs.
-8. **Rust Lint Gate**: `cargo clippy --all-targets -- -D warnings`. A real gate rather than advice, because the backend embeds the platform keyboard hooks, where a clippy warning is worth reading.
-9. **Rust Unit Test Gate**: Runs every `#[cfg(test)]` module in `src-tauri` — settings load/repair/migrate, atomic persistence, corrupt-file quarantine, CLI parsing, portable mode, the panic hook, and the hotkey engine's parser, bitset, keycode maps and hook helpers.
-10. **Architecture Map Gate**: Refreshes `ARCHITECTURE.md` with accurate file metrics and directory trees.
+7. **Rust Cargo Compilation Gate**: Verifies backend compilation against the Tauri 3 alpha and OS APIs.
+8. **Release-Profile Compilation Gate**: `cargo check --release`. The WebView2 hardening (`webview_hardening.rs`) exists only without `debug_assertions`, and it is where the `webview2-com` / `windows-core` / `tauri-runtime-wry` types meet — a version skew there used to pass every other gate and fail `tauri build`. Cheap after the first run (no codegen).
+9. **Rust Lint Gate**: `cargo clippy --all-targets -- -D warnings`. A real gate rather than advice, because the backend embeds the platform keyboard hooks, where a clippy warning is worth reading.
+10. **Rust Unit Test Gate**: Runs every `#[cfg(test)]` module in `src-tauri` — settings load/repair/migrate, atomic persistence, corrupt-file quarantine, CLI parsing, portable mode, the panic hook, and the hotkey engine's parser, bitset, keycode maps and hook helpers.
+11. **Architecture Map Gate**: Refreshes `ARCHITECTURE.md` with accurate file metrics and directory trees.
 
 > The gates use package-script indirection (`bun run lint`, not a hardcoded oxlint
 > invocation), so changing a script in `package.json` updates the suite, CI, and

@@ -6,9 +6,9 @@ This document outlines the security model, data protection guarantees, and vulne
 
 ## 🛡️ Security Architecture
 
-### 1. Tauri v2 Capability & Permission Model
+### 1. Tauri Capability & Permission Model (the v2 model, unchanged in v3)
 
-Tauri v2 enforces a strict capability-based security model. Webview access to native host functionality is locked down by default:
+Tauri enforces a strict capability-based security model (introduced in v2 and carried into the v3 alpha this app runs). Webview access to native host functionality is locked down by default:
 
 - **Explicit Capabilities** (`src-tauri/capabilities/default.json`): The frontend webview is granted only the permissions strictly required to function, scoped to the `main` window:
   - `core:default`: The Tauri core permission set (event, window, webview, path primitives).

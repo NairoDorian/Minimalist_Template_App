@@ -334,6 +334,143 @@ pub fn canonicalize_spec(spec: &str) -> Result<String, String> {
         .map_err(|err| err.to_string())
 }
 
+/// Enforces the binding invariants on a list that arrived as a whole — a
+/// restored backup, a hand-built IPC call — rather than one binding at a time.
+///
+/// `set_global_hotkey` guards the invariants for the single-binding path (it
+/// canonicalizes and refuses a chord another action owns), but
+/// `update_app_settings` takes the entire struct, so whatever list it is handed
+/// would otherwise be persisted verbatim. `settings_migrate` repairs the same
+/// shapes, but only while it *runs*, which is only for an older schema version:
+/// a violating list written through IPC is stamped current and never looked at
+/// again. This closes that path with the same keep-the-first rules:
+///
+/// * every spec is canonicalized, so two spellings of one chord
+///   (`ctrl+alt+a`, `Ctrl+Alt+A`) are recognised as the same chord;
+/// * an empty spec is dropped silently — an unbound action needs no entry;
+/// * an unparseable spec is dropped with a note;
+/// * a second binding for an action already bound is dropped (it would be an
+///   invisible second system-wide hotkey);
+/// * a chord already owned by another action is dropped (one keypress cannot
+///   mean two things).
+///
+/// Returns the kept bindings and one human-readable note per dropped entry,
+/// for the caller to log. Idempotent.
+pub fn normalize_bindings(
+    bindings: Vec<GlobalHotkeyBinding>,
+) -> (Vec<GlobalHotkeyBinding>, Vec<String>) {
+    let mut kept: Vec<GlobalHotkeyBinding> = Vec::with_capacity(bindings.len());
+    let mut notes = Vec::new();
+
+    for binding in bindings {
+        let action = binding.action;
+        let spec = match canonicalize_spec(&binding.spec) {
+            Ok(spec) if spec.is_empty() => continue,
+            Ok(spec) => spec,
+            Err(err) => {
+                notes.push(format!(
+                    "dropped '{}' for '{}': {err}",
+                    binding.spec.trim(),
+                    action.as_str()
+                ));
+                continue;
+            }
+        };
+        if kept.iter().any(|existing| existing.action == action) {
+            notes.push(format!(
+                "dropped a second binding '{spec}' for '{}' — an action has one hotkey",
+                action.as_str()
+            ));
+            continue;
+        }
+        if let Some(owner) = kept.iter().find(|existing| existing.spec == spec) {
+            notes.push(format!(
+                "dropped '{}' because '{spec}' is already bound to '{}'",
+                action.as_str(),
+                owner.action.as_str()
+            ));
+            continue;
+        }
+        kept.push(GlobalHotkeyBinding { action, spec });
+    }
+
+    (kept, notes)
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    fn binding(action: GlobalHotkeyAction, spec: &str) -> GlobalHotkeyBinding {
+        GlobalHotkeyBinding {
+            action,
+            spec: spec.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_clean_list_passes_through_canonicalized() {
+        let (kept, notes) = normalize_bindings(vec![binding(
+            GlobalHotkeyAction::ToggleWindow,
+            " ctrl+alt+a ",
+        )]);
+        assert!(notes.is_empty());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].spec,
+            canonicalize_spec("Ctrl+Alt+A").expect("valid spec")
+        );
+    }
+
+    #[test]
+    fn two_spellings_of_one_chord_cannot_bind_two_actions() {
+        let (kept, notes) = normalize_bindings(vec![
+            binding(GlobalHotkeyAction::ToggleWindow, "Ctrl+Alt+A"),
+            binding(GlobalHotkeyAction::ShowWindow, "ctrl+alt+a"),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].action, GlobalHotkeyAction::ToggleWindow);
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn an_action_keeps_only_its_first_binding() {
+        let (kept, notes) = normalize_bindings(vec![
+            binding(GlobalHotkeyAction::ShowWindow, "Ctrl+Alt+S"),
+            binding(GlobalHotkeyAction::ShowWindow, "Ctrl+Alt+D"),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].spec,
+            canonicalize_spec("Ctrl+Alt+S").expect("valid spec")
+        );
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn empty_specs_vanish_silently_and_garbage_is_reported() {
+        let (kept, notes) = normalize_bindings(vec![
+            binding(GlobalHotkeyAction::ToggleWindow, "   "),
+            binding(GlobalHotkeyAction::ShowWindow, "Ctrl+NotAKey"),
+        ]);
+        assert!(kept.is_empty());
+        assert_eq!(notes.len(), 1, "only the unparseable spec deserves a note");
+    }
+
+    #[test]
+    fn normalizing_twice_changes_nothing() {
+        let input = vec![
+            binding(GlobalHotkeyAction::ToggleWindow, "ctrl+alt+a"),
+            binding(GlobalHotkeyAction::ShowWindow, "Ctrl+Alt+A"),
+            binding(GlobalHotkeyAction::CheckUpdates, "Ctrl+Alt+U"),
+        ];
+        let (once, _) = normalize_bindings(input);
+        let (twice, notes) = normalize_bindings(once.clone());
+        assert_eq!(once, twice);
+        assert!(notes.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

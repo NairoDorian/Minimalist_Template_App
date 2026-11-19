@@ -5,15 +5,27 @@ import path from 'node:path';
 /**
  * Ultimate All-Inclusive Dependency Updater & Sub-Dependency Tracker.
  *
+ * Lineage: this script began in this template, was carried into ZER0
+ * (`Handy_V2/scripts/update-deps.ts`), grew there for two months against a
+ * Tauri 3 alpha and a Solid 2 release candidate, and was ported back in 0.28.0
+ * with ZER0's project-specific seams removed (identity module, CUDA lane, the
+ * Linux gtk hold). Improvements made in either copy are worth carrying across.
+ *
  * Capabilities:
  * 1. Dynamic NPM Registry Querying (@latest versions)
  * 2. Dynamic Crates.io Registry Querying (@latest versions)
  * 3. Direct Dependency Upgrading (package.json & src-tauri/Cargo.toml)
  * 4. Transitive Sub-Dependency & Sub-Sub-Dependency Upgrading (bun update --latest & cargo update)
  * 5. Full Inventory Audit & Diff Tracking (Cargo.lock & node_modules)
- * 6. Vite Production Build Validation (bun run vite:build)
- * 7. Native Cargo Backend Compilation Verification (cargo check)
- * 8. Single-File ARCHITECTURE.md Synchronization
+ * 6. GitHub Actions audit (report only): every `uses: owner/repo@vN` in
+ *    `.github/workflows/` whose action has published a newer major. Reported,
+ *    never rewritten — an Action major can change inputs, and the workflows
+ *    are not compiled by steps 5-7, so a bump there is a reviewed edit.
+ *
+ * Validation (the run's last three steps):
+ * - TypeScript Static Type Checking (bun x tsc -b)
+ * - Vite Production Frontend Build Validation (bun run vite:build)
+ * - Native Cargo Backend Compilation Verification (cargo check)
  *
  * CLI flags:
  *   (no args)      Stable @latest pipeline (default — only `latest` dist-tags,
@@ -30,18 +42,42 @@ import path from 'node:path';
  *   --dry-run      Query registries and print a "would upgrade" report WITHOUT
  *                  writing anything (no bun add, no Cargo.toml edits, no
  *                  lockfile refreshes, no build steps). Safe to run any time.
- *   --help         Show this usage summary.
+ *   --help         Show usage summary.
+ *
+ * Steps 5-7 (`tsc -b` → vite build → cargo check) are not optional. They are the
+ * only proof that a NEW resolution compiles, and a dependency bump is precisely
+ * the change that needs it — a lockfile that resolves is not a lockfile that
+ * builds. `bun run update` (step 1 of the pre-commit routine) and
+ * `bun run precommit:routine` both run this script at full strength for that
+ * reason. There is deliberately no flag to stop early.
+ *
+ * Line-pinned NPM packages (see NPM_LINE_PINNED): a package can be held to one
+ * prerelease LINE — resolved from one dist-tag, never from `latest` — when its
+ * publish state makes every other rule resolve backwards. The three Solid 2
+ * packages are pinned that way; the reasons are printed in the report.
  *
  * Prerelease clobber guard (step 4b): `bun update --latest` resolves the
  * `latest` dist-tag and rewrites package.json specs, silently downgrading
- * exact prerelease pins (e.g. `react-dom 19.3.0-canary-* -> 19.2.8`) and
+ * exact prerelease pins (e.g. `solid-js 2.0.0-rc.9 -> 1.x`) and
  * stripping range operators. After the transitive refresh, prerelease mode
  * re-runs `bun add <pkg>@<spec>` to restore EVERY prerelease pin in the
  * snapshot — whether or not this run targeted it.
  *
  * Compatibility guarantee: every proposed upgrade must survive the validation
- * steps (tsc -b → vite build → cargo check) — steps 1-4 hard-fail (exit 1) on
- * any resolution error, so an incompatible "latest" can never be force-applied.
+ * steps (tsc -b -> vite build -> cargo check) — steps 1-4 hard-fail (exit 1)
+ * on any resolution error, so an incompatible "latest" can never be force-applied.
+ */
+
+/*
+ * Conflict handling (step 4): when `cargo update` fails with "failed to
+ * select a version", the error is parsed, the direct crate in the conflict
+ * chain is held at its current spec with the reason printed once, and the
+ * update is retried — instead of re-running the whole update per crate and
+ * dumping cargo's error twice. The final report marks such crates "Held",
+ * labels spec-only rewrites (lockfile already had the version) as such, and
+ * lists transitive crates that are newer on crates.io but pinned by another
+ * crate's requirement (`cargo update --dry-run --verbose`), so "up to date"
+ * is only printed when it is true.
  */
 
 // --- CLI flag parsing (before anything else so --help/--dry-run are side-effect free) ---
@@ -49,6 +85,373 @@ const cliArgs = new Set(process.argv.slice(2));
 const PRERELEASE_MODE = cliArgs.has('--prerelease');
 const DRY_RUN = cliArgs.has('--dry-run');
 const SHOW_HELP = cliArgs.has('--help') || cliArgs.has('-h');
+
+/**
+ * How long the registry query may take before the run proceeds with whatever
+ * has answered. This script is step 1 of the pre-commit routine, run by hand
+ * before a commit, so a hang here is a hang in the middle of a person's
+ * workflow: a dead network, a black-holed DNS server or a registry that accepts
+ * connections and never replies would otherwise freeze the run with no output
+ * and no way out but Ctrl-C. A package whose query has not answered by the
+ * deadline is simply not upgraded this run — the same outcome as a package that
+ * is already current.
+ */
+const QUERY_DEADLINE_MS = Number(process.env.UPDATE_QUERY_TIMEOUT_MS ?? 30_000) || 30_000;
+
+/**
+ * The npm package name, used to identify this script to crates.io.
+ *
+ * crates.io's crawler policy asks API clients for a descriptive User-Agent and
+ * rejects anonymous ones. Read from `package.json` rather than hardcoded so a
+ * `rename-project` rebrand renames the client too.
+ */
+const PACKAGE_SLUG: string = (() => {
+  try {
+    const name = (JSON.parse(fs.readFileSync('package.json', 'utf8')) as { name?: unknown }).name;
+    return typeof name === 'string' && name.length > 0 ? name : 'tauri-app';
+  } catch {
+    return 'tauri-app';
+  }
+})();
+
+/**
+ * The root crate's `[package] name`, which cargo's resolver errors name as the
+ * head of a conflict chain (`parseCargoResolveError` needs it to tell this
+ * crate's direct dependencies from transitive ones).
+ */
+const CARGO_PACKAGE_NAME: string = (() => {
+  try {
+    const manifest = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+    return manifest.match(/^\[package\][^[]*?^name\s*=\s*"([^"]+)"/ms)?.[1] ?? PACKAGE_SLUG;
+  } catch {
+    return PACKAGE_SLUG;
+  }
+})();
+
+/**
+ * Crates that stay on their STABLE line even under --prerelease.
+ * `libc`: its README says "depend on 0.2"; the 1.0.0-alpha.* tags are
+ * snapshots of the v1.0 `main` branch published on the same day as the
+ * matching 0.2.x. Every other crate in the graph depends on 0.2, so taking
+ * the alpha only compiles a second libc on Linux (2026-09-11 research).
+ */
+const CARGO_STABLE_ONLY: ReadonlySet<string> = new Set(['libc']);
+
+/**
+ * Cargo crates held at the EXACT version the manifest names, with the reason
+ * printed in the report.
+ *
+ * This is the narrower sibling of `CARGO_MAJOR_LOCKED`, and it exists for a
+ * failure mode a major ceiling cannot express: a prerelease family whose crates
+ * must all be the SAME release. A requirement like `3.0.0-alpha.2` reads as
+ * `>=3.0.0-alpha.2, <3.0.0`, so every crate in the family also accepts alpha.3
+ * and alpha.4 — `cargo update` unifies them forward on its own, and a family
+ * split across two releases resolves and then fails to compile with an error
+ * that names none of the crates you would think to look at.
+ *
+ * The Tauri family is exactly that: `tauri-build` validates `tauri.conf.json`
+ * through `tauri-utils`, the plugins (git, `plugins-workspace` `branch = "v3"`)
+ * are written against one core API, and the alphas carry their breaking changes
+ * in the prerelease position (alpha.3 moved `run_on_main_thread` onto the
+ * `Manager` trait; alpha.4 removed the `macos-private-api` feature and the
+ * `macOSPrivateApi` config key). From alpha.3 until 2026-11-03 the `v3` plugins
+ * still called the removed inherent method, which held the core at alpha.2; the
+ * family moved to alpha.6 / alpha.5 / alpha.4 on 2026-11-15 by hand, as one edit.
+ *
+ * Holding the *direct* dependency is not enough on its own, and that is why the
+ * set below names the members nothing in this crate calls directly
+ * (`tauri-runtime`, `tauri-utils`, `tauri-macros`, `tauri-plugin`,
+ * `tauri-codegen`): only a manifest entry can carry an `=`, so those are
+ * declared in `src-tauri/Cargo.toml` purely to be pinned. Removing one from the
+ * manifest, or from this set, lets `cargo update` split the family again.
+ *
+ * The hold reads the version from the manifest rather than repeating it here,
+ * so it follows the pin: move every `=` in `Cargo.toml` (and the CLI in
+ * `package.json`) in one edit and the targets move with them. This script never
+ * moves the family itself — a new alpha is a reviewed change, not a refresh.
+ */
+const CARGO_VERSION_LOCKED: ReadonlySet<string> = new Set([
+  'tauri',
+  'tauri-build',
+  'tauri-codegen',
+  'tauri-macros',
+  'tauri-plugin',
+  'tauri-runtime',
+  'tauri-runtime-wry',
+  'tauri-utils',
+]);
+
+const VERSION_LOCKED_REASON =
+  'held at the exact manifest version with `=`: the whole Tauri family has to ' +
+  'stay on one release with the `v3` plugins and `@tauri-apps/cli`, and the ' +
+  'alphas break in the prerelease position (alpha.3 run_on_main_thread, alpha.4 ' +
+  'macos-private-api). A bare requirement lets `cargo update` unify part of the ' +
+  'family forward into a lockfile that resolves and cannot compile. Move the ' +
+  'whole set by hand in one edit (src-tauri/Cargo.toml + package.json).';
+
+/**
+ * Crates held inside the major they are installed on, with the reason printed
+ * in the report. A crate lands here when a cross-major bump would be *invisible
+ * to the validation this script runs*: steps 5-7 compile the frontend and
+ * `cargo check` the backend for the HOST only, so a dependency in a
+ * `[target.'cfg(other_os)'.dependencies]` section is never compiled during an
+ * update on any one machine, and a broken bump sails through to CI — or worse,
+ * to a release build for the platform nobody is running locally.
+ *
+ * This is a narrower rule than "don't bump other platforms' deps" (those are
+ * real upgrades and CI does compile them, eventually). It catches the case
+ * where the bump is provably wrong against a sibling pin in the same manifest,
+ * which is a fact about the two crates and not about the machine.
+ */
+const CARGO_MAJOR_LOCKED: ReadonlyMap<string, string> = new Map([
+  [
+    'windows',
+    'the keyboard hook (`src-tauri/src/hotkeys/platform/windows`) shares the ' +
+      '`windows` generation Tauri links — `tauri-runtime-wry 3.0.0-alpha.6` → ' +
+      'wry 0.57 → windows 0.62. A newer generation would still compile, but as ' +
+      'a SECOND copy of the largest crate in the graph (until 0.28.0 the app ' +
+      "built 0.58 for the hook beside Tauri's 0.61, for exactly this reason). " +
+      "It moves when Tauri's moves.",
+  ],
+  [
+    'webview2-com',
+    '`src-tauri/Cargo.toml` names this crate directly, in the Windows target ' +
+      "section, to reach ICoreWebView2Settings3 through the webview's " +
+      'controller. Its COM types only unify with the rest of the app when it is ' +
+      'the SAME webview2-com instance `tauri-runtime-wry` links: two versions ' +
+      'mean two windows_core versions and the Interface cast stops resolving. ' +
+      '`tauri-runtime-wry 3.0.0-alpha.6` requires webview2-com ^0.39, which is ' +
+      'the 0.39 the manifest pins, so the ceiling here holds both halves on ' +
+      '0.39.x. It moves when that crate moves — the same event that moves the ' +
+      'manifest pin.',
+  ],
+  [
+    'windows-core',
+    'The other half of the same pin, and the reason the ceiling above is not ' +
+      'enough on its own: `webview2-com 0.39` speaks to `windows-core 0.62`, so ' +
+      "the manifest's direct `windows-core` has to be a 0.62 as well or the " +
+      "COM interface types in the app and in the webview's controller come from " +
+      'different crates. Unheld, --prerelease proposes `0.100.0` for it — a ' +
+      'real published version, ~38 minors of breaking changes away from the ' +
+      'one the webview stack links, and a compile failure rather than a silent ' +
+      'one only because the cast stops resolving.',
+  ],
+]);
+
+/** One prerelease line a package is held to, and why. */
+interface LinePin {
+  /**
+   * The dist-tags candidates are read from. Whichever carries the best version
+   * on the accepted major that is strictly newer than the installed one wins —
+   * the tags are only where candidates come from; the LINE (major + no
+   * downgrade) is the pin. Listing `latest` is safe here, unlike on the
+   * unpinned path, because the major filter refuses the old line and the
+   * newness test refuses a downgrade.
+   */
+  tags: readonly string[];
+  /** The accepted major. A candidate outside it is refused outright. */
+  major: number;
+  /** One sentence for the report, naming what goes wrong without it. */
+  reason: string;
+}
+
+/**
+ * NPM packages that may be upgraded freely WITHIN their major but never across
+ * it — the ceiling is whatever major is installed, so it moves when the
+ * maintainer moves the package by hand.
+ *
+ * `@tauri-apps/*` is the reason. Those packages are not a library the app uses;
+ * they are the JS half of the IPC that the Rust `tauri` crate implements, and
+ * the two are coupled at the major: `tauri = "=3.0.0-alpha.6"` in
+ * `src-tauri/Cargo.toml` speaks to a 3.x JS API. Prerelease mode probes
+ * dist-tags and takes the newest by **core version**, deliberately ignoring
+ * range operators — which is right for a package that is merely newer, and
+ * wrong across a major, where it would hand a 4.x JS API to a 3.x backend with
+ * nothing to catch it: the two halves live on opposite sides of the IPC and
+ * only meet at runtime. A ceiling of `3.x` is what keeps a bump inside the
+ * alpha line this project is actually tracking, since the alphas carry their
+ * breaking changes in the prerelease position (alpha.1 → alpha.2 renamed
+ * `Builder::js_init_script` to `initialization_script` — the JS packages and
+ * the crates have to move together or not at all).
+ *
+ * The packages are already pinned with `~` or an exact version for the same
+ * reason, but a range does not stop prerelease mode — it ignores ranges — so
+ * this is the rule that does not depend on remembering to pin each new plugin.
+ * `@tauri-apps/cli` is included: the CLI and the crate are the same version.
+ *
+ * The ceiling is a version *prefix* (`ceilingPrefix`), not a major number, so
+ * a 0.x package is held on `0.<minor>` — where semver actually puts its
+ * breaking changes — rather than on a `0` that permits everything.
+ */
+const NPM_MAJOR_LOCKED_PREFIXES: readonly string[] = ['@tauri-apps/'];
+
+/**
+ * NPM packages held at the EXACT version in `package.json`, with the reason
+ * printed in the report — the npm twin of `CARGO_VERSION_LOCKED`, and needed for
+ * the same reason: a major ceiling cannot express "these two have to be the same
+ * release", and within one major a prerelease family moves apart on its own.
+ *
+ * `@tauri-apps/cli` is the case. It carries `config.schema.json` and validates
+ * `tauri.conf.json` **before cargo ever runs**, so the CLI and the `tauri` crate
+ * are not merely coupled at the major — they are the same release, and a CLI
+ * ahead of the core rejects a config the core still requires. Concretely, the
+ * core's `b9a77ebb refactor(core)!: remove the macos-private-api feature flag`
+ * dropped `macOSPrivateApi` from `app` in `tauri.conf.json`, so while the core
+ * was held at alpha.2:
+ *
+ *   * CLI `3.0.0-alpha.4`  ->  `Error "tauri.conf.json" ... Additional properties
+ *                             are not allowed ('macOSPrivateApi' was unexpected)`
+ *   * crate `=3.0.0-alpha.2` ->  still required the key.
+ *
+ * A `3.x` ceiling waved alpha.4 straight through, which is how a CLI at alpha.4
+ * ended up beside a core held at alpha.2 and `bun run tauri dev` refused to
+ * start — while `cargo check`, clippy and the whole test suite passed, because
+ * none of them run the CLI. Two halves of one dependency, validated by two
+ * different tools, failing in the gap between them. (Both are at alpha.6 now,
+ * and the key is gone from the config.)
+ *
+ * Like the Cargo hold, this reads the version from the manifest, so moving the
+ * pin here is unnecessary: replace the version in `package.json` and the target
+ * follows. `NPM_MAJOR_LOCKED_PREFIXES` still covers every OTHER `@tauri-apps/*`
+ * package — the plugins follow the plugin crate release, which is a separate
+ * line from the core's, and floating them within 3.x is correct.
+ */
+const NPM_VERSION_LOCKED: ReadonlySet<string> = new Set(['@tauri-apps/cli']);
+
+const NPM_VERSION_LOCKED_REASON =
+  'held at the exact manifest version: `@tauri-apps/cli` validates ' +
+  'tauri.conf.json itself, before cargo runs, so it has to be the SAME release ' +
+  'as the `tauri` crate, which `CARGO_VERSION_LOCKED` holds at its manifest `=`. ' +
+  'A CLI ahead of the core can reject a config the core still requires (as ' +
+  'alpha.4 did with `macOSPrivateApi`), and only `bun run tauri` notices: ' +
+  'cargo check, clippy and the test suite all pass. Move it with the family.';
+
+const isMajorLocked = (name: string): boolean =>
+  NPM_MAJOR_LOCKED_PREFIXES.some((prefix) => name.startsWith(prefix));
+
+/**
+ * The version prefix a ceiling permits, as a list of leading core components.
+ *
+ * For a 1.x-and-up version that is just the major — `1.4.2` under a major-1
+ * ceiling is `[1]`. For a **0.x** version the ceiling has to reach one
+ * component further: semver puts a 0.x series' breaking changes in the MINOR
+ * position, so `0.18.2 → 0.19.0` is a breaking change and a ceiling of `[0]`
+ * would wave it through while looking like it was doing something.
+ *
+ * Measured from the *installed* spec, so the ceiling follows the pin: the day
+ * the manifest says `0.19`, the hold is `0.19` and nothing is blocked.
+ */
+function ceilingPrefix(core: readonly number[]): number[] {
+  const major = core[0] ?? 0;
+  return major > 0 ? [major] : [0, core[1] ?? 0];
+}
+
+/** Does `version` sit inside a prefix produced by `ceilingPrefix`? */
+function isUnderCeiling(version: string, prefix: readonly number[]): boolean {
+  const core = parseVersion(cleanVersion(version)).core;
+  return prefix.every((part, i) => core[i] === part);
+}
+
+/** `[2]` → `"2.x"`, `[0,18]` → `"0.18.x"` — how a hold reads in a report. */
+function ceilingLabel(prefix: readonly number[]): string {
+  return `${prefix.join('.')}.x`;
+}
+
+/**
+ * The ceiling to apply to a package installed at `cleanedSpec`, or `undefined`
+ * when there is no version to derive one from.
+ *
+ * The distinction matters and is not "is the major 0": a **0.x version is a
+ * real version** whose breaking changes live in the minor (`gtk 0.18 → 0.19`),
+ * while a spec like `workspace:*` or a git ref cleans to something with no
+ * numeric core at all, and a ceiling derived from that would be a prefix of
+ * zeros that nothing can satisfy. `parseVersion` gives both a core of `[0,0,0]`
+ * — it has to return *some* core — so the test is on the spec's shape, not on
+ * the parsed number.
+ */
+function ceilingFor(cleanedSpec: string): number[] | undefined {
+  return /^\d+\.\d+/.test(cleanedSpec) ? ceilingPrefix(parseVersion(cleanedSpec).core) : undefined;
+}
+
+/** Options for one NPM resolution. */
+interface NpmResolveOptions {
+  prerelease: boolean;
+  linePin?: LinePin | undefined;
+  /** Refuse any target outside this version prefix. */
+  majorCeiling?: readonly number[] | undefined;
+  /** Receives the package's dist-tags when the packument was read. */
+  onTags?: ((tags: Readonly<Record<string, string>>) => void) | undefined;
+}
+
+/**
+ * NPM packages held to ONE prerelease line, resolved from named dist-tags.
+ *
+ * The Solid 2 toolchain is why this exists. `--prerelease` mode probes every
+ * prerelease dist-tag and takes the best strictly-newer candidate, which is
+ * right for a package whose tags climb a single line — and wrong for these
+ * three, because their published state is incoherent (read from the registry
+ * 2026-09-12, and re-checked whenever this list is edited):
+ *
+ *   solid-js              latest 1.9.15          next 2.0.0-rc.8
+ *   @solidjs/web          latest 2.0.0-rc.0      next 2.0.0-rc.8
+ *   @solidjs/vite-plugin  latest 3.0.0-next.43   next 3.0.0-next.35
+ *
+ * Every existing rule points the wrong way for at least one of them: `solid-js`'s
+ * `latest` is the previous **major**, `@solidjs/web`'s `latest` is a
+ * **downgrade** (rc.0 < rc.8), and `@solidjs/vite-plugin`'s `next` is **older**
+ * than its `latest` — so "newest published", "the `latest` tag" and "the `next`
+ * tag" each resolve backwards for one package. A migration that pins these and
+ * then lets a routine `bun run update` run is reverted by it.
+ *
+ * So the **line** is pinned, not the version: read the listed tags, refuse
+ * anything off the accepted major, refuse a downgrade. It follows the line
+ * forward by itself as Solid publishes.
+ *
+ * **Solid 2.0 went stable** (read 2026-11-19: `solid-js` and `@solidjs/web`
+ * `latest` 2.0.3 with `next` left behind at 2.0.0-rc.23; `@solidjs/vite-plugin`
+ * `latest` 3.0.1). The incoherence that created these pins is gone, and the
+ * pins are kept for the one job they still do: holding the **major**. The day
+ * Solid starts publishing 3.0 prereleases under `next`, a `--prerelease` run
+ * would otherwise move the app onto an unreleased framework major as if it
+ * were a patch — the jump this template made deliberately, file by file, from
+ * Solid 1 to 2. Changing `major` here is how that migration is started.
+ *
+ * Until 2026-09-24 each pin read exactly ONE tag, `next` — and for
+ * `@solidjs/vite-plugin` `next` was the stale tag, so the updater could never
+ * move the plugin again. Reading `latest` beside `next` is safe because the
+ * major filter and the no-downgrade rule refuse what made either tag wrong.
+ * The report prints the registry's current tags under each reason, so the
+ * snapshot above is history, not a claim.
+ */
+const NPM_LINE_PINNED: ReadonlyMap<string, LinePin> = new Map([
+  [
+    'solid-js',
+    {
+      tags: ['next', 'latest'],
+      major: 2,
+      reason:
+        'held on the 2.x major: `next` is where a Solid 3 prerelease will appear first, and taking it would migrate the app to an unreleased framework major unreviewed',
+    },
+  ],
+  [
+    '@solidjs/web',
+    {
+      tags: ['next', 'latest'],
+      major: 2,
+      reason:
+        'the renderer moves with `solid-js` — same major, same guard; a 2.x renderer on a 3.x core (or the reverse) does not run',
+    },
+  ],
+  [
+    '@solidjs/vite-plugin',
+    {
+      tags: ['next', 'latest'],
+      major: 3,
+      reason:
+        'the 3.x plugin is the Solid 2 compiler; its tags have leapfrogged before (`next` sat below `latest` for months), so the newer of the two on 3.x wins, never a downgrade',
+    },
+  ],
+]);
 
 /** NPM dist-tags probed when --prerelease is active — every tag is evaluated, the best strictly-newer candidate wins. */
 const PRERELEASE_TAGS: readonly string[] = [
@@ -67,7 +470,10 @@ if (SHOW_HELP) {
   bun run update-deps                          Stable @latest pipeline (default)
   bun run update-deps --prerelease             Prefer beta/alpha/RC versions for direct deps
   bun run update-deps --dry-run                Report what WOULD upgrade (no changes made)
-  bun run update-deps --prerelease --dry-run   Preview prerelease upgrades, apply nothing`);
+  bun run update-deps --prerelease --dry-run   Preview prerelease upgrades, apply nothing
+
+Steps 5-7 (tsc -b, vite build, cargo check) always run after an apply: a
+lockfile that resolves is not a lockfile that builds.`);
   process.exit(0);
 }
 
@@ -75,11 +481,47 @@ interface DependencyStatus {
   name: string;
   ecosystem: 'NPM (Bun)' | 'Cargo (Rust)';
   type: 'runtime' | 'dev' | 'cargo-dep' | 'cargo-build';
+  /**
+   * The dist-tags read for a line-pinned package, printed under its reason so
+   * the report shows the registry as it is now, not as the reason was written.
+   */
+  registryTags?: Readonly<Record<string, string>> | undefined;
+  /** Cargo.toml section the crate was read from (Cargo rows only). */
+  section?: string | undefined;
   currentVersion: string;
   latestVersion: string;
   needsUpdate: boolean;
   /** True when the resolved target is a pre-release (--prerelease mode). */
   prerelease: boolean;
+  /** Set for a package held to one prerelease line; carries the reason. */
+  linePin?: LinePin | undefined;
+  /** The version prefix a package may not move past (see ceilingPrefix). */
+  majorCeiling?: readonly number[] | undefined;
+  /**
+   * Why this package is ceilinged, when the reason is specific to it. The
+   * prefix rule (`NPM_MAJOR_LOCKED_PREFIXES`) explains itself once for the
+   * whole group and leaves this unset; a named Cargo hold
+   * (`CARGO_MAJOR_LOCKED`) sets it, because "windows" and "webview2-com" are held
+   * for entirely different reasons.
+   */
+  holdReason?: string | undefined;
+  /**
+   * True for a crate held at the exact manifest version by
+   * `CARGO_VERSION_LOCKED`. Reported separately from a major ceiling: the
+   * ceiling is about a different product, this is about a family that has to
+   * move as one, and the report says which is which.
+   */
+  versionLocked?: boolean | undefined;
+}
+
+/**
+ * The `bun add` spec for an outdated NPM package: the exact resolved target in
+ * prerelease mode and for any held package (line pin or ceiling), `@latest`
+ * otherwise.
+ */
+function npmInstallSpec(s: DependencyStatus): string {
+  const exact = PRERELEASE_MODE || s.linePin !== undefined || s.majorCeiling !== undefined;
+  return `${s.name}@${exact ? s.latestVersion : 'latest'}`;
 }
 
 interface SubDepDiff {
@@ -96,15 +538,21 @@ function isPrereleaseVersion(version: string): boolean {
 
 /**
  * Splits a semver string into numeric core parts and a prerelease identifier.
- * `noUncheckedIndexedAccess` makes `coreStr` `string | undefined`; a version
- * string always has a core part before any `-`, so the fallback to "0" is
- * unreachable but satisfies the type checker.
+ *
+ * The split is at the FIRST hyphen only: a prerelease may itself contain
+ * hyphens (`@playwright/test`'s nightlies are `1.64.0-alpha-2026-09-23`), and
+ * the former `split("-", 2)` truncated every one of them to `alpha`, so all the
+ * nightlies of a line compared equal and none was ever offered as an upgrade.
+ * Build metadata (`+…`) takes no part in precedence and is dropped.
  */
 function parseVersion(v: string): { core: number[]; pre: string | null } {
-  const [coreStr, pre] = v.split('-', 2);
-  const core = (coreStr ?? '0').split('.').map((n) => parseInt(n, 10) || 0);
+  const bare = v.split('+', 1)[0] ?? '';
+  const dash = bare.indexOf('-');
+  const coreStr = dash < 0 ? bare : bare.slice(0, dash);
+  const pre = dash < 0 ? null : bare.slice(dash + 1);
+  const core = coreStr.split('.').map((n) => parseInt(n, 10) || 0);
   while (core.length < 3) core.push(0);
-  return { core, pre: pre ?? null };
+  return { core, pre };
 }
 
 /**
@@ -117,7 +565,7 @@ function parseVersion(v: string): { core: number[]; pre: string | null } {
  * numeric identifiers sorting below alphanumeric ones.
  *
  * Used to reject prerelease dist-tags that point at OLDER lines than the
- * installed version (e.g. `@tauri-apps/api`'s `next` tag → `2.0.1` while the
+ * installed version (e.g. `@tauri-apps/api`'s `next` tag -> `2.0.1` while the
  * project already uses `^2.11.1`) — upgrades must never downgrade.
  */
 function compareVersions(a: string, b: string): number {
@@ -178,6 +626,29 @@ function cleanVersion(v: string): string {
 }
 
 /**
+ * Is this `package.json` spec a version the registry can answer for?
+ *
+ * `cleanVersion` strips a leading range operator and returns everything else
+ * unchanged, so a spec that names a *source* rather than a version comes back
+ * as itself, parses as an empty core and loses every comparison — the registry's
+ * newest release then reads as an upgrade over "0.0.0". In ZER0 that is how a
+ * plugin consumed from its Tauri 3 fork (a `git+https://…` spec) was proposed
+ * to move to the registry's same-numbered release — the upstream Tauri 2
+ * package, while the fork was the v3-aware build the app needed. This template
+ * has no such spec today; the rule is kept so adopting one is safe.
+ *
+ * The Cargo side already skips `git = "` lines for the same reason. There the
+ * shape is a table field; here it is the spec itself, so the test is on
+ * anything that is not a version range. Such a dependency is owned by its own
+ * mechanism — the fork, the workspace, the tarball — and this script leaves it
+ * alone rather than trading it for a same-numbered stranger.
+ */
+function isRegistrySpec(spec: string): boolean {
+  if (typeof spec !== 'string' || spec.length === 0) return false;
+  return !/^(git(\+|:)|github:|https?:|file:|link:|workspace:|portal:|npm:|jsr:)/.test(spec.trim());
+}
+
+/**
  * Resolves the target NPM version.
  * Stable mode: the `latest` dist-tag (cheap `/latest` endpoint), returned only
  * when it is STRICTLY NEWER than `current` — never a downgrade of a
@@ -195,15 +666,27 @@ function cleanVersion(v: string): string {
 async function fetchLatestNpmVersion(
   pkgName: string,
   current: string,
-  prerelease = false
+  options: NpmResolveOptions
 ): Promise<string | null> {
+  const { prerelease, linePin, majorCeiling, onTags } = options;
   try {
-    if (!prerelease) {
+    // A line pin always takes the packument path, in both modes: `/latest`
+    // cannot express "the newest on THIS line", and reading it would make the
+    // protection depend on the accident of what `latest` points at today.
+    if (!prerelease && !linePin) {
       const response = await fetch(`https://registry.npmjs.org/${pkgName}/latest`, {
         headers: { Accept: 'application/json' },
       });
       if (response.ok) {
         const data = (await response.json()) as { version?: string };
+        // The ceiling holds in stable mode too: `latest` is exactly where a
+        // cross-major jump comes from (a new major of `@tauri-apps/*`).
+        if (
+          data.version &&
+          majorCeiling !== undefined &&
+          !isUnderCeiling(data.version, majorCeiling)
+        )
+          return null;
         return data.version && compareVersions(data.version, current) > 0 ? data.version : null;
       }
       return null;
@@ -217,6 +700,7 @@ async function fetchLatestNpmVersion(
       time?: Record<string, string>;
     };
     const tags = data['dist-tags'] ?? {};
+    onTags?.(tags);
     const times = data.time ?? {};
     const currentTime = times[current] ?? null;
 
@@ -233,36 +717,60 @@ async function fetchLatestNpmVersion(
       return compareVersions(v, current) > 0;
     };
 
-    let best: { version: string; publishedAt: string | null } | null = null;
-    for (const tag of PRERELEASE_TAGS) {
+    // A line pin narrows the probe to its own tags: the other prerelease tags
+    // are not merely unnecessary here, they are the wrong question — see
+    // NPM_LINE_PINNED.
+    const probedTags = linePin ? linePin.tags : PRERELEASE_TAGS;
+
+    type Candidate = { version: string; publishedAt: string | null };
+    // Ranking between two candidates: highest core first; for equal cores the
+    // later publish wins; lexical SemVer otherwise.
+    const beats = (a: Candidate, b: Candidate): boolean => {
+      const coreDiff = compareCores(a.version, b.version);
+      if (coreDiff !== 0) return coreDiff > 0;
+      if (a.publishedAt !== null && b.publishedAt !== null && a.publishedAt !== b.publishedAt) {
+        return new Date(a.publishedAt).getTime() > new Date(b.publishedAt).getTime();
+      }
+      return compareVersions(a.version, b.version) > 0;
+    };
+
+    let best: Candidate | null = null;
+    for (const tag of probedTags) {
       const candidate = tags[tag];
       const publishedAt = candidate ? (times[candidate] ?? null) : null;
       if (!candidate || !isStrictlyNewer(candidate, publishedAt)) continue;
-      if (best === null) {
-        best = { version: candidate, publishedAt };
-        continue;
-      }
-      const coreDiff = compareCores(candidate, best.version);
-      let takeCandidate: boolean;
-      if (coreDiff !== 0) {
-        takeCandidate = coreDiff > 0;
-      } else if (
-        publishedAt !== null &&
-        best.publishedAt !== null &&
-        publishedAt !== best.publishedAt
-      ) {
-        takeCandidate = new Date(publishedAt).getTime() > new Date(best.publishedAt).getTime();
-      } else {
-        takeCandidate = compareVersions(candidate, best.version) > 0;
-      }
-      if (takeCandidate) best = { version: candidate, publishedAt };
+      // Off the accepted line is a different product, not an upgrade: for
+      // `solid-js` that is the 1.x line, which would undo the Solid 2 pin, and
+      // for `@tauri-apps/*` it is an API for a different Tauri. A line pin
+      // states its accepted major outright; a ceiling is a prefix measured
+      // from the installed spec (and reaches two components on a 0.x version).
+      const ceiling = linePin ? [linePin.major] : (majorCeiling ?? undefined);
+      if (ceiling !== undefined && !isUnderCeiling(candidate, ceiling)) continue;
+      const next = { version: candidate, publishedAt };
+      if (best === null || beats(next, best)) best = next;
     }
 
+    // A line pin never falls back to `latest` — that fallback is precisely what
+    // reverts these packages (see NPM_LINE_PINNED), so `null` ("nothing newer
+    // on the line the app is built against") is the correct answer there.
+    if (linePin) return best?.version ?? null;
+
+    // The fallback is a candidate like any other, so the ceiling applies to it
+    // too — `latest` is exactly where a cross-major jump would come from for a
+    // package whose prerelease tags are all on the installed major.
     const latestTag = tags['latest'] ?? null;
-    return (
-      best?.version ??
-      (latestTag && isStrictlyNewer(latestTag, times[latestTag] ?? null) ? latestTag : null)
-    );
+    const latestOk =
+      latestTag !== null &&
+      (majorCeiling === undefined || isUnderCeiling(latestTag, majorCeiling)) &&
+      isStrictlyNewer(latestTag, times[latestTag] ?? null);
+    if (!latestOk) return best?.version ?? null;
+    // A stale prerelease tag can still be strictly newer than `current` while
+    // `latest` has moved past it: rank the two with the same rule.
+    const latestCandidate = {
+      version: latestTag,
+      publishedAt: times[latestTag] ?? null,
+    };
+    return best === null || beats(latestCandidate, best) ? latestTag : best.version;
   } catch {
     return null;
   }
@@ -271,32 +779,48 @@ async function fetchLatestNpmVersion(
 /**
  * Resolves the target crates.io version.
  * Stable mode: `max_version` (highest non-prerelease).
- * Prerelease mode: `newest_version` — but only when it is STRICTLY NEWER than
- * the installed version; otherwise falls back to `max_version`.
+ * Prerelease mode: `newest_version` — when it is at least the installed
+ * version (a pinned newest pre-release then reads "already @latest" instead
+ * of showing the older stable as its target); otherwise `max_version`.
  */
 async function fetchLatestCrateVersion(
   crateName: string,
   current: string,
-  prerelease = false
+  prerelease = false,
+  majorCeiling?: readonly number[]
 ): Promise<string | null> {
   try {
     const response = await fetch(`https://crates.io/api/v1/crates/${crateName}`, {
-      headers: { 'User-Agent': 'MinimalisticAppUpdater/1.0' },
+      headers: { 'User-Agent': `${PACKAGE_SLUG}-deps-updater` },
     });
     if (response.ok) {
       const data = (await response.json()) as {
-        crate?: { max_version?: string; newest_version?: string };
+        crate?: {
+          max_version?: string;
+          max_stable_version?: string;
+          newest_version?: string;
+        };
       };
       const crate = data.crate;
       if (!crate) return null;
+      // A ceiling refuses a candidate outright rather than falling back to the
+      // older stable: the newest stable IS the cross-major target here, so
+      // "the highest version under the ceiling" is the only useful answer, and
+      // `null` means nothing on the installed major is newer than what is
+      // already there.
+      const under = (v: string | undefined): string | undefined =>
+        v !== undefined && (majorCeiling === undefined || isUnderCeiling(v, majorCeiling))
+          ? v
+          : undefined;
       if (
         prerelease &&
         crate.newest_version &&
-        compareVersions(crate.newest_version, current) > 0
+        under(crate.newest_version) !== undefined &&
+        compareVersions(crate.newest_version, current) >= 0
       ) {
         return crate.newest_version;
       }
-      return crate.max_version || null;
+      return under(crate.max_stable_version) ?? under(crate.max_version) ?? null;
     }
   } catch {}
   return null;
@@ -317,8 +841,51 @@ function parseCargoLock(filePath: string): Record<string, string> {
   return map;
 }
 
+/** Every locked version per crate name, ascending (Cargo.lock is sorted). */
+function parseCargoLockAll(filePath: string): Record<string, string[]> {
+  const map: Record<string, string[]> = {};
+  if (!fs.existsSync(filePath)) return map;
+  for (const block of fs.readFileSync(filePath, 'utf8').split('[[package]]')) {
+    const name = block.match(/^\s*name\s*=\s*"([^"]+)"/m)?.[1];
+    const ver = block.match(/^\s*version\s*=\s*"([^"]+)"/m)?.[1];
+    if (name && ver) (map[name] ??= []).push(ver);
+  }
+  return map;
+}
+
+/**
+ * The locked version a direct spec resolves to: the highest one on the same
+ * release line (major, or minor while major is 0). `cargo update sysinfo`
+ * is "ambiguous" when two versions are locked; `sysinfo@0.39.6` is not.
+ */
+function pickLockedVersion(versions: string[], spec: string): string | undefined {
+  const { core } = parseVersion(cleanVersion(spec));
+  const sameLine = versions.filter((v) => {
+    const c = parseVersion(v).core;
+    if (c[0] !== core[0]) return false;
+    return core[0] !== 0 || c[1] === core[1];
+  });
+  const pool = sameLine.length > 0 ? sameLine : versions;
+  return pool.toSorted(compareVersions).at(-1);
+}
+
+/**
+ * Installed NPM packages: read from `bun.lock` (every resolved package,
+ * whatever the linker), falling back to a node_modules scan that follows
+ * the symlinks Bun's isolated linker leaves at the top level.
+ */
 function parseBunInstalledVersions(): Record<string, string> {
   const map: Record<string, string> = {};
+  const lockPath = path.resolve('bun.lock');
+  if (fs.existsSync(lockPath)) {
+    const lock = fs.readFileSync(lockPath, 'utf8');
+    // `"name": ["name@version", …]` — the key is the install path (nested
+    // duplicates appear as "parent/name"), the first element the resolution.
+    for (const m of lock.matchAll(/^\s*"([^"]+)":\s*\["(?:@[^"/]+\/)?[^"@]+@([^"]+)"/gm)) {
+      if (m[1] !== undefined && m[2] !== undefined) map[m[1]] = m[2];
+    }
+    if (Object.keys(map).length > 0) return map;
+  }
   const nmPath = path.resolve('node_modules');
   if (!fs.existsSync(nmPath)) return map;
 
@@ -326,7 +893,7 @@ function parseBunInstalledVersions(): Record<string, string> {
     try {
       const entries = fs.readdirSync(dir, { withFileTypes: true });
       entries.forEach((e) => {
-        if (e.isDirectory()) {
+        if (e.isDirectory() || e.isSymbolicLink()) {
           if (e.name.startsWith('@')) {
             scan(path.join(dir, e.name));
           } else {
@@ -348,25 +915,310 @@ function parseBunInstalledVersions(): Record<string, string> {
   return map;
 }
 
+// No shell: every command here is `bun` or `cargo`, which resolve as
+// executables on every platform, and cmd.exe would eat the `^` / `<` / `>` of
+// a version spec such as `solid-js@^2.0.0-rc.1`.
 function runCmd(
   cmd: string,
   args: string[],
-  cwd?: string
+  cwd?: string,
+  env?: NodeJS.ProcessEnv
 ): { success: boolean; durationMs: number } {
   const start = Date.now();
-  const res = spawnSync(cmd, args, { stdio: 'inherit', shell: true, cwd });
+  const res = spawnSync(cmd, args, { stdio: 'inherit', cwd, env });
   const durationMs = Date.now() - start;
   return { success: res.status === 0, durationMs };
 }
 
-/** Renders a single direct-dependency row for the dry-run / summary reports. */
-function renderStatusRow(s: DependencyStatus): string {
-  const namePadded = s.name.padEnd(34, ' ');
-  const ecoPadded = s.ecosystem.padEnd(12, ' ');
-  const currPadded = s.currentVersion.padEnd(9, ' ');
-  const latPadded = s.latestVersion.padEnd(9, ' ');
-  const preMark = s.prerelease ? '⚠️' : ' ';
-  return ` ${namePadded} | ${ecoPadded} | ${currPadded} | ${latPadded} | ${preMark}`;
+/** Output of a captured child process. */
+interface CapturedRun {
+  success: boolean;
+  durationMs: number;
+  stdout: string;
+  stderr: string;
+}
+
+/** Like runCmd, but captures output so callers can filter or diagnose it. */
+function runCaptured(cmd: string, args: string[], cwd?: string): CapturedRun {
+  const start = Date.now();
+  const res = spawnSync(cmd, args, { encoding: 'utf8', cwd });
+  return {
+    success: res.status === 0,
+    durationMs: Date.now() - start,
+    stdout: res.stdout ?? '',
+    stderr: res.stderr ?? '',
+  };
+}
+
+/**
+ * Prints the useful part of a `cargo update` run — what was locked, added,
+ * updated or removed. The "Updating git repository …" / "Updating crates.io
+ * index" chatter (eight lines per invocation here) collapses into one line.
+ */
+function printCargoUpdateOutput(run: CapturedRun, indent = '   '): void {
+  let refreshed = 0;
+  for (const raw of `${run.stdout}\n${run.stderr}`.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/^Updating (git repository|crates\.io index)/.test(line)) {
+      refreshed++;
+      continue;
+    }
+    if (
+      /^(note: pass `--verbose`|note: to see how you depend|warning: not updating lockfile)/.test(
+        line
+      )
+    ) {
+      continue;
+    }
+    console.log(`${indent}${line}`);
+  }
+  if (refreshed > 0) {
+    console.log(`${indent}(refreshed ${refreshed} package source(s))`);
+  }
+}
+
+/** First `error:` line of a cargo run, without the prefix. */
+function firstCargoError(stderr: string): string {
+  const line = stderr
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => l.startsWith('error'));
+  return (line ?? 'cargo failed').replace(/^error(\[[^\]]*\])?:\s*/, '');
+}
+
+interface CargoResolveConflict {
+  /** Direct dependencies of this package that the conflict chain runs through. */
+  directCrates: string[];
+  /** One sentence a human can act on. */
+  reason: string;
+}
+
+/**
+ * Reads cargo's "failed to select a version" error and names the direct
+ * dependency to hold back plus why. Handles the `links` case (two crates
+ * would link the same native library, e.g. gtk 0.19 vs rfd's gtk-sys 0.18
+ * both linking gtk-3) and plain version-requirement conflicts.
+ */
+function parseCargoResolveError(stderr: string, ownPackage: string): CargoResolveConflict | null {
+  const text = stderr.replace(/\r/g, '');
+  const failed = text.match(/failed to select a version for (?:the requirement )?`([^`]+)`/);
+  if (!failed || failed[1] === undefined) return null;
+  const subject = failed[1].replace(/\s*=\s*".*$/, '');
+  const own = ownPackage.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const direct = new Set<string>();
+  const directRe = new RegExp(
+    'which satisfies dependency `([A-Za-z0-9_-]+)[^`]*` of package `' + own + '\\b',
+    'g'
+  );
+  for (const m of text.matchAll(directRe)) {
+    if (m[1] !== undefined) direct.add(m[1]);
+  }
+  // "required by package `rfd v0.16.0`" followed by the chain up to us.
+  const chain: string[] = [];
+  const lines = text.split('\n');
+  const reqIdx = lines.findIndex((l) => /required by package `/.test(l));
+  if (reqIdx >= 0) {
+    const first = lines[reqIdx]?.match(/required by package `([^`]+)`/);
+    if (first?.[1]) chain.push(first[1]);
+    for (const l of lines.slice(reqIdx + 1)) {
+      const m = l.match(/which satisfies dependency `[^`]+` of package `([^`(]+)/);
+      if (!m || m[1] === undefined) break;
+      const pkg = m[1].trim();
+      if (pkg.startsWith(ownPackage)) break;
+      chain.push(pkg);
+    }
+  }
+  const requirement = text.match(/versions that meet the requirements `([^`]+)`/);
+  const links = text.match(/links to the native library `([^`]+)`/);
+  const conflicting = text.match(/conflicts with a previous package[^\n]*\n\s*package `([^`]+)`/);
+  const needs = `${chain[0] ?? 'another crate'}${chain.length > 1 ? ` (via ${chain.slice(1).join(' ← ')})` : ''} needs ${subject}${requirement?.[1] ? ` ${requirement[1]}` : ''}`;
+  const reason = links
+    ? `${needs}, ${conflicting?.[1] ?? 'the new version'} would be linked as well, and cargo allows one crate to link the native library ${links[1]}. Retry when ${chain[0] ?? 'that crate'} moves to the new line.`
+    : `${needs}, which the new spec cannot satisfy.`;
+  return { directCrates: [...direct], reason };
+}
+
+/** Rewrites the version of each listed crate in a Cargo.toml body to `^target`. */
+function rewriteCargoSpecs(content: string, crates: readonly DependencyStatus[]): string {
+  let out = content;
+  for (const crate of crates) {
+    // Inline and simple spec forms are mutually exclusive per line. Anchor
+    // to line boundaries so `dialog` never matches inside `log`.
+    const escaped = crate.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regInline = new RegExp(
+      `(^|[\\r\\n])(\\s*${escaped}\\s*=\\s*\\{[^}]*version\\s*=\\s*")([^"]+)(")`,
+      'g'
+    );
+    const regSimple = new RegExp(`(^|[\\r\\n])(\\s*${escaped}\\s*=\\s*")([^"]+)(")`, 'g');
+    out = out
+      .replace(regInline, `$1$2^${crate.latestVersion}$4`)
+      .replace(regSimple, `$1$2^${crate.latestVersion}$4`);
+  }
+  return out;
+}
+
+/** Aligned text table; column widths follow the content. */
+function printTable(headers: string[], rows: string[][]): void {
+  const widths = headers.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)));
+  const line = (cells: string[]) =>
+    ' ' + cells.map((c, i) => c.padEnd(widths[i] ?? 0, ' ')).join(' | ');
+  console.log(line(headers));
+  console.log(
+    widths
+      .map((w) => '-'.repeat(w + 2))
+      .join('+')
+      .slice(1)
+  );
+  for (const r of rows) console.log(line(r));
+}
+
+/**
+ * Ecosystem label for reports. A crate declared in more than one Cargo.toml
+ * section (serde in build-dependencies, tokio in dev-dependencies, a
+ * target-specific block) gets the section in its label, so the second row
+ * is not a mystery duplicate: "Cargo (build)", "Cargo (dev)",
+ * "Cargo (linux)", "Cargo (all(windows, x86_64))".
+ */
+function ecosystemLabel(s: DependencyStatus): string {
+  if (s.ecosystem !== 'Cargo (Rust)' || !s.section) return s.ecosystem;
+  const section = s.section;
+  if (section === 'dependencies') return 'Cargo (Rust)';
+  if (section.startsWith('build-')) return 'Cargo (build)';
+  if (section.startsWith('dev-')) return 'Cargo (dev)';
+  const cfg = section.match(/cfg\((.*)\)'\.dependencies$/)?.[1];
+  if (!cfg) return 'Cargo (Rust)';
+  const short = cfg
+    .replace(/target_(?:os|arch|env|family)\s*=\s*"([^"]+)"/g, '$1')
+    .replace(/\s+/g, ' ');
+  return `Cargo (${short})`;
+}
+
+interface BehindLatest {
+  name: string;
+  current: string;
+  available: string;
+  requiredBy: string;
+}
+
+/**
+ * Crates cargo will not move because another crate's requirement pins them:
+ * the "Unchanged X vA (available: vB)" lines of a verbose dry run, each with
+ * its first dependents from `cargo tree --invert`.
+ */
+function listCratesBehindLatest(cargoCwd: string): BehindLatest[] {
+  const run = runCaptured('cargo', ['update', '--dry-run', '--verbose'], cargoCwd);
+  const out: BehindLatest[] = [];
+  for (const m of `${run.stdout}\n${run.stderr}`.matchAll(
+    /Unchanged (\S+) v(\S+) \(available: v(\S+)\)/g
+  )) {
+    const [, name, current, available] = m;
+    if (!name || !current || !available) continue;
+    const tree = runCaptured(
+      'cargo',
+      [
+        'tree',
+        '-i',
+        `${name}@${current}`,
+        '--depth',
+        '1',
+        '--prefix',
+        'none',
+        // Build/dev edges and every target: a crate pinned only by a
+        // Linux build-dependency would otherwise print "nothing".
+        '--edges',
+        'normal,build,dev',
+        '--target',
+        'all',
+      ],
+      cargoCwd
+    );
+    const dependents = [
+      ...new Set(
+        tree.stdout
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter((l) => l && !l.startsWith(`${name} v`))
+          .map((l) => l.replace(/ \(.*\)$/, ''))
+      ),
+    ];
+    out.push({
+      name,
+      current,
+      available,
+      requiredBy:
+        dependents.slice(0, 3).join(', ') +
+        (dependents.length > 3 ? `, +${dependents.length - 3}` : ''),
+    });
+  }
+  return out;
+}
+
+/**
+ * Explains every package that deliberately will NOT move: the prerelease lines
+ * (NPM_LINE_PINNED) and the majors nothing may cross (NPM_MAJOR_LOCKED_PREFIXES).
+ *
+ * Printed by the dry run and the real run alike, and on every run that finds
+ * one rather than only the run that added it. The reason a package ignores
+ * `latest` is invisible from `package.json`; without this, a package silenced
+ * by policy is indistinguishable from one silenced by a bug.
+ */
+function printHeldNotes(allStatuses: readonly DependencyStatus[]): void {
+  const linePinned = allStatuses.flatMap((s) => (s.linePin ? [{ s, pin: s.linePin }] : []));
+  if (linePinned.length > 0) {
+    console.log(
+      '\n 📌 Held to a prerelease LINE — resolved from one dist-tag, never from `latest`:'
+    );
+    for (const { s, pin } of linePinned) {
+      const tagList = pin.tags.map((t) => '`' + t + '`').join(' / ');
+      console.log(
+        `    ${s.name} ${s.currentVersion}: reads ${tagList}, ${pin.major}.x only, never a downgrade`
+      );
+      console.log(`      ${pin.reason}`);
+      const tags = s.registryTags;
+      if (tags !== undefined) {
+        const now = Object.entries(tags)
+          .map(([tag, version]) => `${tag} ${version}`)
+          .join(' · ');
+        console.log(`      registry now: ${now}`);
+      }
+    }
+  }
+
+  // An exact-version hold also carries a ceiling (derived from the same
+  // reason), but it has its own section below; listing it here too printed the
+  // whole Tauri family twice, each time with the full paragraph.
+  const ceilinged = allStatuses.flatMap((s) =>
+    s.majorCeiling === undefined || s.versionLocked === true ? [] : [{ s, ceiling: s.majorCeiling }]
+  );
+  if (ceilinged.length > 0) {
+    console.log('\n 🔒 Held within the version it is on — a cross-major target is a different');
+    console.log('    product, not an upgrade; the ceiling follows the installed spec:');
+    for (const { s, ceiling } of ceilinged) {
+      console.log(`    ${s.name} ${s.currentVersion}: stays on ${ceilingLabel(ceiling)}`);
+      // Only a named hold carries a reason; the prefix rule's reason is the
+      // paragraph above it, and printing it once per package would bury it.
+      if (s.holdReason !== undefined) console.log(`      ${s.holdReason}`);
+    }
+  }
+
+  // Printed on its own, because it is the one hold that is NOT about a major:
+  // a newer prerelease of any of these would be refused too, so a reader
+  // scanning the upgrade table needs to see that this is a decision rather
+  // than an oversight.
+  const pinned = allStatuses.filter((s) => s.versionLocked === true);
+  if (pinned.length > 0) {
+    console.log('\n 📌 Held at the EXACT manifest version (Cargo.toml `=` / package.json) — a');
+    console.log('    prerelease family moves as one, and a newer alpha is a reviewed edit:');
+    for (const s of pinned) {
+      console.log(`    ${s.name} ${s.currentVersion}`);
+    }
+    // One paragraph per distinct reason (the crates share one, the CLI has its
+    // own), rather than one per package.
+    for (const reason of new Set(pinned.map((s) => s.holdReason ?? VERSION_LOCKED_REASON))) {
+      console.log(`      ${reason}`);
+    }
+  }
 }
 
 /**
@@ -390,15 +1242,18 @@ function printDryRunReport(allStatuses: DependencyStatus[]): void {
     }
   } else {
     console.log(` 📦 ${outdated.length} direct dependency(-ies) WOULD be upgraded:`);
-    console.log(' Dependency / Crate Name           | Ecosystem    | Current   | Target    | Pre');
-    console.log(
-      '------------------------------------+--------------+-----------+-----------+-----'
+    printTable(
+      ['Dependency / Crate Name', 'Ecosystem', 'Current', 'Target', 'Pre'],
+      outdated
+        .toSorted((a, b) => a.name.localeCompare(b.name))
+        .map((s) => [
+          s.name,
+          ecosystemLabel(s),
+          s.currentVersion,
+          s.latestVersion,
+          s.prerelease ? '⚠️' : '',
+        ])
     );
-    outdated
-      .toSorted((a, b) => a.name.localeCompare(b.name))
-      .forEach((s) => {
-        console.log(renderStatusRow(s));
-      });
     if (preCount > 0) {
       console.log(
         `\n ⚠️  ${preCount} target(s) are PRE-RELEASES (--prerelease mode). Pre-release builds are`
@@ -406,6 +1261,8 @@ function printDryRunReport(allStatuses: DependencyStatus[]): void {
       console.log('    unstable by nature — review them before applying with a real run.');
     }
   }
+
+  printHeldNotes(allStatuses);
 
   console.log('\n Steps that WOULD run in a real invocation:');
   console.log('   1-2. bun add <pkg>@<target>        (runtime + dev deps)');
@@ -418,10 +1275,126 @@ function printDryRunReport(allStatuses: DependencyStatus[]): void {
   }
   console.log('   5.   bun x tsc -b                   (type validation)');
   console.log('   6.   bun run vite:build             (frontend build)');
-  console.log('   7.   cargo check                    (backend compile)');
-  console.log('       bun run arch                    (ARCHITECTURE.md sync)');
+  console.log('   7.   cargo check                    (backend compile, debug + release profiles)');
   console.log('=================================================================');
   console.log('✅ Dry run complete — nothing was modified.');
+}
+
+/** One `uses: owner/repo@vN` reference found in a workflow file. */
+interface WorkflowActionRef {
+  /** Workflow file, relative to the repository root. */
+  file: string;
+  /** 1-based line number of the `uses:` line. */
+  line: number;
+  /** `owner/repo` — the part that names a GitHub repository. */
+  repo: string;
+  /** The major the workflow pins, e.g. `4` for `@v4`. */
+  major: number;
+}
+
+/**
+ * Every `uses:` reference in `.github/workflows/` that pins a **major tag**
+ * (`@v4`). Branch refs (`dtolnay/rust-toolchain@stable`), commit SHAs and exact
+ * versions are skipped: they are deliberate choices with their own update
+ * story, and a newer major is the only thing this audit can say anything true
+ * about. Sub-path actions (`owner/repo/sub@v1`) are audited by their repository.
+ */
+function collectWorkflowActionRefs(): WorkflowActionRef[] {
+  const dir = path.resolve('.github', 'workflows');
+  if (!fs.existsSync(dir)) return [];
+  const refs: WorkflowActionRef[] = [];
+  for (const name of fs.readdirSync(dir)) {
+    if (!/\.ya?ml$/.test(name)) continue;
+    const lines = fs.readFileSync(path.join(dir, name), 'utf8').split(/\r?\n/);
+    lines.forEach((text, index) => {
+      const match = text.match(
+        /^\s*(?:-\s*)?uses:\s*['"]?([\w.-]+\/[\w.-]+)(?:\/[^@\s'"]*)?@v(\d+)['"]?\s*(?:#.*)?$/
+      );
+      if (!match?.[1] || !match[2]) return;
+      refs.push({
+        file: `.github/workflows/${name}`,
+        line: index + 1,
+        repo: match[1],
+        major: Number(match[2]),
+      });
+    });
+  }
+  return refs;
+}
+
+/**
+ * Reports (never rewrites) workflow Actions whose repository has published a
+ * newer major than the one pinned.
+ *
+ * Report-only because an Action major is an interface change — renamed inputs,
+ * a new Node runtime, a changed artifact name (tauri-action v1 renamed the
+ * macOS updater archive) — and nothing in steps 5-7 runs a workflow, so a
+ * rewritten `uses:` would be unvalidated by construction. The audit's job is
+ * to make the stale pin visible; the bump is a reviewed edit.
+ *
+ * Uses the GitHub REST API's `releases/latest`, authenticated with
+ * `GITHUB_TOKEN` when it is set (the anonymous limit is 60 requests an hour,
+ * plenty for a handful of Actions, but CI shares the address). Bounded by
+ * `QUERY_DEADLINE_MS` like every other registry query here: an Action that
+ * does not answer is simply not reported.
+ */
+async function auditGithubActions(): Promise<void> {
+  const refs = collectWorkflowActionRefs();
+  if (refs.length === 0) return;
+  const repos = [...new Set(refs.map((r) => r.repo))];
+  const token = process.env.GITHUB_TOKEN;
+  const headers: Record<string, string> = {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': `${PACKAGE_SLUG}-deps-updater`,
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+  const newestMajor = new Map<string, { major: number; tag: string }>();
+  await Promise.all(
+    repos.map(async (repo) => {
+      try {
+        const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
+          headers,
+          signal: AbortSignal.timeout(QUERY_DEADLINE_MS),
+        });
+        if (!res.ok) return;
+        const tag = ((await res.json()) as { tag_name?: string }).tag_name ?? '';
+        // `v7.0.1`, `action-v1.0.0`: the major is the first number after a `v`.
+        const major = Number(tag.match(/(?:^|[^0-9])v?(\d+)(?:\.\d+)*$/)?.[1]);
+        if (Number.isInteger(major)) newestMajor.set(repo, { major, tag });
+      } catch {
+        // Unanswered is unreported — see the doc comment.
+      }
+    })
+  );
+
+  const stale = refs.filter((r) => {
+    const newest = newestMajor.get(r.repo);
+    return newest !== undefined && newest.major > r.major;
+  });
+  console.log('=================================================================');
+  console.log(
+    `🎬 GITHUB ACTIONS AUDIT (${refs.length} major-tag refs, ${repos.length} actions, report only)`
+  );
+  console.log('=================================================================');
+  if (stale.length === 0) {
+    console.log(
+      ` ⚡ Every pinned Action major is current (${newestMajor.size}/${repos.length} answered).`
+    );
+  } else {
+    printTable(
+      ['Action', 'Pinned', 'Newest release', 'Where'],
+      stale.map((r) => [
+        r.repo,
+        `v${r.major}`,
+        newestMajor.get(r.repo)?.tag ?? '?',
+        `${r.file}:${r.line}`,
+      ])
+    );
+    console.log(
+      " ✏️  Bump these by hand after reading each Action's release notes for breaking inputs."
+    );
+  }
+  console.log('');
 }
 
 async function updateEverything() {
@@ -458,50 +1431,86 @@ async function updateEverything() {
   const allStatuses: DependencyStatus[] = [];
   const fetchPromises: Promise<void>[] = [];
 
-  // 1. Query NPM runtime dependencies
-  Object.entries(runtimeDeps).forEach(([name, ver]) => {
-    fetchPromises.push(
-      (async () => {
-        const currClean = cleanVersion(ver as string);
-        const latest = await fetchLatestNpmVersion(name, currClean, PRERELEASE_MODE);
-        const needs = latest ? currClean !== latest : false;
-        allStatuses.push({
-          name,
-          ecosystem: 'NPM (Bun)',
-          type: 'runtime',
-          currentVersion: ver as string,
-          latestVersion: latest || currClean,
-          needsUpdate: needs,
-          prerelease: needs && latest !== null && isPrereleaseVersion(latest),
-        });
-      })()
-    );
-  });
+  /**
+   * Queues the registry query for every package in one `package.json` section.
+   * The line pin is looked up here rather than at the call site so a pinned
+   * package is protected wherever it is declared — moving `solid-js` from
+   * `dependencies` to `devDependencies` must not silently unpin it.
+   */
+  const queryNpmDeps = (deps: Record<string, unknown>, type: DependencyStatus['type']): void => {
+    Object.entries(deps).forEach(([name, ver]) => {
+      // A git / workspace / file spec is not a version to compare — see
+      // `isRegistrySpec`. Left to its own mechanism, exactly as the Cargo side
+      // leaves `git = "` lines alone.
+      if (!isRegistrySpec(ver as string)) return;
+      fetchPromises.push(
+        (async () => {
+          const currClean = cleanVersion(ver as string);
+          const linePin = NPM_LINE_PINNED.get(name);
+          // An exact-version hold outranks the line pin and the ceiling alike:
+          // the manifest already says the version, so the target IS the current
+          // one and no registry answer is needed. Still reported (rather than
+          // skipped) so the package appears with its reason instead of vanishing.
+          const versionLocked = NPM_VERSION_LOCKED.has(name);
+          // "Within the major it is already on": the ceiling is measured from
+          // the installed spec, not declared, so bumping the Rust side and the
+          // JS side together moves it without anyone editing this file.
+          const majorCeiling =
+            versionLocked || !isMajorLocked(name) ? undefined : ceilingFor(currClean);
+          const latest = versionLocked
+            ? currClean
+            : await fetchLatestNpmVersion(name, currClean, {
+                prerelease: PRERELEASE_MODE,
+                linePin,
+                majorCeiling,
+              });
+          const needs = latest !== null && compareVersions(latest, currClean) > 0;
+          allStatuses.push({
+            name,
+            ecosystem: 'NPM (Bun)',
+            type,
+            currentVersion: ver as string,
+            latestVersion: latest || currClean,
+            needsUpdate: needs,
+            prerelease: needs && latest !== null && isPrereleaseVersion(latest),
+            linePin,
+            majorCeiling,
+            versionLocked,
+            holdReason: versionLocked ? NPM_VERSION_LOCKED_REASON : undefined,
+          });
+        })()
+      );
+    });
+  };
 
-  // 2. Query NPM devDependencies
-  Object.entries(devDeps).forEach(([name, ver]) => {
-    fetchPromises.push(
-      (async () => {
-        const currClean = cleanVersion(ver as string);
-        const latest = await fetchLatestNpmVersion(name, currClean, PRERELEASE_MODE);
-        const needs = latest ? currClean !== latest : false;
-        allStatuses.push({
-          name,
-          ecosystem: 'NPM (Bun)',
-          type: 'dev',
-          currentVersion: ver as string,
-          latestVersion: latest || currClean,
-          needsUpdate: needs,
-          prerelease: needs && latest !== null && isPrereleaseVersion(latest),
-        });
-      })()
-    );
-  });
+  // 1-2. Query NPM runtime dependencies, then devDependencies.
+  queryNpmDeps(runtimeDeps, 'runtime');
+  queryNpmDeps(devDeps, 'dev');
 
   // 3. Parse Cargo.toml dependency sections safely
+  // Matches every section whose name ends in `dependencies` (covers `dependencies`,
+  // `build-dependencies`, `dev-dependencies`, and all `target.'cfg(...)'.dependencies`
+  // variants including cfg(unix), cfg(not(any(...))), cfg(all(windows, x86_64)), etc.)
   const cargoContent = fs.readFileSync(cargoTomlPath, 'utf8');
   const lines = cargoContent.split(/\r?\n/);
   let currentSection = '';
+
+  // Collect all crate names patched in [patch.crates-io] so git forks / patches are never queried on crates.io
+  const patchedCrates = new Set<string>();
+  let inPatchSection = false;
+  lines.forEach((line: string) => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      inPatchSection = trimmed === '[patch.crates-io]';
+      return;
+    }
+    if (inPatchSection) {
+      const match = trimmed.match(/^([a-zA-Z0-9_-]+)\s*=/);
+      if (match && match[1]) {
+        patchedCrates.add(match[1]);
+      }
+    }
+  });
 
   const cargoCratesToQuery: { name: string; ver: string; section: string }[] = [];
 
@@ -512,12 +1521,21 @@ async function updateEverything() {
       return;
     }
 
-    if (['dependencies', 'build-dependencies', 'dev-dependencies'].includes(currentSection)) {
+    // Match any Cargo.toml section that holds dependencies (top-level, build,
+    // dev, or any cfg-target-scoped variant) without hardcoding platform names.
+    if (currentSection.endsWith('dependencies')) {
+      if (trimmed.includes('git =')) return; // skip custom git forks
       const matchInline = trimmed.match(/^([a-zA-Z0-9_-]+)\s*=\s*\{[^}]*version\s*=\s*"([^"]+)"/);
       const matchSimple = trimmed.match(/^([a-zA-Z0-9_-]+)\s*=\s*"([^"]+)"/);
       const match = matchInline || matchSimple;
       if (match && match[1] !== undefined && match[2] !== undefined) {
-        cargoCratesToQuery.push({ name: match[1], ver: match[2], section: currentSection });
+        if (!patchedCrates.has(match[1])) {
+          cargoCratesToQuery.push({
+            name: match[1],
+            ver: match[2],
+            section: currentSection,
+          });
+        }
       }
     }
   });
@@ -526,28 +1544,70 @@ async function updateEverything() {
     fetchPromises.push(
       (async () => {
         const currClean = cleanVersion(ver);
-        const latest = await fetchLatestCrateVersion(name, currClean, PRERELEASE_MODE);
-        const needs = latest ? currClean !== latest : false;
+        // An exact-version hold wins over every other rule: the manifest already
+        // says `=`, so the target IS the current version and no registry answer
+        // is needed. Queried anyway (rather than skipped) so the crate still
+        // appears in the report with its reason instead of vanishing from it.
+        const versionLocked = CARGO_VERSION_LOCKED.has(name);
+        // Same shape as the NPM ceiling: the limit is the version the manifest
+        // already asks for, so it moves when the maintainer moves the pin.
+        const holdReason = versionLocked ? VERSION_LOCKED_REASON : CARGO_MAJOR_LOCKED.get(name);
+        const majorCeiling = holdReason === undefined ? undefined : ceilingFor(currClean);
+        const latest = versionLocked
+          ? currClean
+          : await fetchLatestCrateVersion(
+              name,
+              currClean,
+              PRERELEASE_MODE && !CARGO_STABLE_ONLY.has(name),
+              majorCeiling
+            );
+        const needs = latest !== null && compareVersions(latest, currClean) > 0;
         allStatuses.push({
           name,
           ecosystem: 'Cargo (Rust)',
-          type: section === 'build-dependencies' ? 'cargo-build' : 'cargo-dep',
+          section,
+          type: section.includes('build') ? 'cargo-build' : 'cargo-dep',
           currentVersion: ver,
           latestVersion: latest || currClean,
           needsUpdate: needs,
           prerelease: needs && latest !== null && isPrereleaseVersion(latest),
+          majorCeiling,
+          holdReason,
+          versionLocked,
         });
       })()
     );
   });
 
-  await Promise.all(fetchPromises);
+  // Bounded, not merely awaited — see QUERY_DEADLINE_MS. A query still
+  // outstanding when the deadline passes is abandoned rather than waited on,
+  // and its package reads as "already at its target" for this run: nothing is
+  // upgraded on the strength of an answer that never arrived.
+  let queryTimedOut = false;
+  await Promise.race([
+    Promise.all(fetchPromises),
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        queryTimedOut = true;
+        resolve();
+      }, QUERY_DEADLINE_MS);
+      // Don't hold the event loop open for a deadline nothing is racing.
+      timer.unref();
+    }),
+  ]);
   const queryDuration = Date.now() - queryStart;
-  console.log(`✅ Registry query complete (${queryDuration}ms)\n`);
+  console.log(
+    `✅ Registry query complete (${queryDuration}ms)` +
+      (queryTimedOut
+        ? ` — deadline ${QUERY_DEADLINE_MS}ms reached with ${allStatuses.length} of ${fetchPromises.length} answered; the rest are left as they are`
+        : '') +
+      '\n'
+  );
 
   // --- DRY RUN: report what would change, then stop before any write occurs ---
   if (DRY_RUN) {
     printDryRunReport(allStatuses);
+    await auditGithubActions();
     process.exit(0);
   }
 
@@ -564,10 +1624,10 @@ async function updateEverything() {
       `📦 Step 1/7: Upgrading ${outdatedRuntime.length} Outdated NPM Runtime Dependencies...`
     );
     // Stable mode pins @latest; prerelease mode pins the exact resolved target
-    // version (dist-tags are transient, exact versions are deterministic).
-    const targets = outdatedRuntime.map(
-      (s) => `${s.name}@${PRERELEASE_MODE ? s.latestVersion : 'latest'}`
-    );
+    // version (dist-tags are transient, exact versions are deterministic). A
+    // held package takes its resolved version in either mode: `@latest` is the
+    // 1.x major for `solid-js` and a cross-major jump for a ceilinged package.
+    const targets = outdatedRuntime.map(npmInstallSpec);
     const { success, durationMs } = runCmd('bun', ['add', ...targets]);
     if (!success) {
       console.error('❌ Error: NPM runtime dependency upgrade failed!');
@@ -583,9 +1643,7 @@ async function updateEverything() {
     console.log('🛠️ Step 2/7: NPM DevDependencies -> All direct packages already @target');
   } else {
     console.log(`🛠️ Step 2/7: Upgrading ${outdatedDev.length} Outdated NPM DevDependencies...`);
-    const targets = outdatedDev.map(
-      (s) => `${s.name}@${PRERELEASE_MODE ? s.latestVersion : 'latest'}`
-    );
+    const targets = outdatedDev.map(npmInstallSpec);
     const { success, durationMs } = runCmd('bun', ['add', '-d', ...targets]);
     if (!success) {
       console.error('❌ Error: NPM devDependency upgrade failed!');
@@ -601,24 +1659,14 @@ async function updateEverything() {
     console.log('🦀 Step 3/7: Cargo Rust Crates -> All Cargo.toml specs already @target');
   } else {
     console.log(
-      `🦀 Step 3/7: Syncing ${outdatedCargo.length} Outdated Cargo Crates in Cargo.toml...`
+      `🦀 Step 3/7: Rewriting ${outdatedCargo.length} Cargo.toml spec(s): ${outdatedCargo
+        .map((c) => `${c.name} ${c.currentVersion} → ^${c.latestVersion}`)
+        .join(', ')}`
     );
-    let newCargoContent = cargoContent;
-    outdatedCargo.forEach((crate) => {
-      // Inline and simple Cargo.toml spec forms are mutually exclusive per line,
-      // so applying both replacements unconditionally is safe and avoids the
-      // stateful lastIndex quirk of `RegExp.test()` on global regexes.
-      const regInline = new RegExp(
-        `(${crate.name}\\s*=\\s*\\{[^}]*version\\s*=\\s*")([^"]+)(")`,
-        'g'
-      );
-      const regSimple = new RegExp(`(${crate.name}\\s*=\\s*")([^"]+)(")`, 'g');
-      newCargoContent = newCargoContent
-        .replace(regInline, `$1^${crate.latestVersion}$3`)
-        .replace(regSimple, `$1^${crate.latestVersion}$3`);
-    });
-    fs.writeFileSync(cargoTomlPath, newCargoContent, 'utf8');
-    console.log('✅ Cargo.toml specifications updated to @target!');
+    fs.writeFileSync(cargoTomlPath, rewriteCargoSpecs(cargoContent, outdatedCargo), 'utf8');
+    console.log(
+      '✅ Cargo.toml specs rewritten (step 4 verifies they resolve; a conflict reverts the crate at fault)'
+    );
   }
   console.log('');
 
@@ -642,35 +1690,112 @@ async function updateEverything() {
     process.exit(1);
   }
   const cargoCwd = path.resolve('src-tauri');
-  const { success: cargoSuccess, durationMs: cargoMs } = runCmd('cargo', ['update'], cargoCwd);
-  if (cargoSuccess) {
-    console.log(`✅ Step 4/7 Sub-dependency update complete (${cargoMs}ms)\n`);
+  const OWN_PACKAGE = CARGO_PACKAGE_NAME;
+  /** Direct crates whose bump was reverted this run, with the reason. */
+  const heldCargo = new Map<string, string>();
+  let acceptedCargo: DependencyStatus[] = outdatedCargo.slice();
+  let cargoRun = runCaptured('cargo', ['update'], cargoCwd);
+
+  // A resolution conflict names the crate at fault: hold that one back and
+  // retry, at most once per bumped crate.
+  for (
+    let attempt = 0;
+    !cargoRun.success && acceptedCargo.length > 0 && attempt <= outdatedCargo.length;
+    attempt++
+  ) {
+    const conflict = parseCargoResolveError(cargoRun.stderr, OWN_PACKAGE);
+    const culprits = (conflict?.directCrates ?? []).filter((n) =>
+      acceptedCargo.some((c) => c.name === n)
+    );
+    if (!conflict || culprits.length === 0) break;
+    for (const name of culprits) {
+      const crate = acceptedCargo.find((c) => c.name === name);
+      if (!crate) continue;
+      heldCargo.set(name, conflict.reason);
+      console.log(
+        `  ⏸ ${name} stays at ${crate.currentVersion} (wanted ^${crate.latestVersion}): ${conflict.reason}`
+      );
+    }
+    acceptedCargo = acceptedCargo.filter((c) => !culprits.includes(c.name));
+    fs.writeFileSync(cargoTomlPath, rewriteCargoSpecs(cargoContent, acceptedCargo), 'utf8');
+    cargoRun = runCaptured('cargo', ['update'], cargoCwd);
+  }
+
+  // A conflict the parser could not attribute: try the bumps one at a time,
+  // each against its precise locked version (a bare name is ambiguous when
+  // two versions of the crate are locked).
+  if (
+    !cargoRun.success &&
+    acceptedCargo.length > 0 &&
+    /failed to select a version/.test(cargoRun.stderr)
+  ) {
+    console.log('  ⚠️ cargo could not resolve the new specs together; trying them one at a time…');
+    const lockVersions = parseCargoLockAll(cargoLockPath);
+    let kept: DependencyStatus[] = [];
+    for (const crate of acceptedCargo) {
+      const candidate = [...kept, crate];
+      fs.writeFileSync(cargoTomlPath, rewriteCargoSpecs(cargoContent, candidate), 'utf8');
+      const locked = pickLockedVersion(lockVersions[crate.name] ?? [], crate.currentVersion);
+      const one = runCaptured(
+        'cargo',
+        ['update', locked ? `${crate.name}@${locked}` : crate.name],
+        cargoCwd
+      );
+      if (one.success) {
+        kept = candidate;
+        console.log(`  ✅ ${crate.name} → ^${crate.latestVersion}`);
+      } else {
+        const why = firstCargoError(one.stderr);
+        heldCargo.set(crate.name, why);
+        console.log(
+          `  ⏸ ${crate.name} stays at ${crate.currentVersion} (wanted ^${crate.latestVersion}): ${why}`
+        );
+      }
+    }
+    acceptedCargo = kept;
+    fs.writeFileSync(cargoTomlPath, rewriteCargoSpecs(cargoContent, acceptedCargo), 'utf8');
+    cargoRun = runCaptured('cargo', ['update'], cargoCwd);
+  }
+
+  printCargoUpdateOutput(cargoRun);
+  if (cargoRun.success) {
+    console.log(`✅ Step 4/7 Sub-dependency update complete (${cargoRun.durationMs}ms)\n`);
   } else {
-    console.error('❌ Error: Cargo sub-crate update failed!');
+    console.error('❌ Error: cargo update failed:');
+    console.error(cargoRun.stderr.trim());
     process.exit(1);
   }
 
   // --- Snapshot Sub-Dependency States AFTER Lockfile Refresh ---
   const afterCargoLock = parseCargoLock(cargoLockPath);
-  const afterBunLock = parseBunInstalledVersions();
 
   // --- Step 4b: Re-pin Prerelease Pins (Clobber Guard) ---
   // `bun update --latest` resolves the `latest` dist-tag and REWRITES package.json
-  // specs (e.g. `react-dom 19.3.0-canary-d5736f09-20260507 -> 19.2.8`), silently
+  // specs (e.g. `solid-js 2.0.0-rc.9 -> 1.x`, its `latest` major), silently
   // downgrading ANY exact prerelease pin — including ones this run did not touch
-  // — and stripping range operators. Stable mode is unaffected (`@latest` pins
-  // survive unchanged), so this re-pin only runs in prerelease mode and restores
-  // every direct NPM dependency whose snapshot spec is a prerelease.
-  if (PRERELEASE_MODE) {
+  // — and stripping range operators. This restores every direct NPM dependency
+  // whose snapshot spec is a prerelease.
+  //
+  // A **line-pinned** package is restored in stable mode too, and that
+  // exception is the whole reason the guard is no longer inside the
+  // `PRERELEASE_MODE` branch: `latest` is wrong for all three Solid packages
+  // (see NPM_LINE_PINNED), so a bare `bun run update-deps` — documented in
+  // AGENTS.md and run by hand — would otherwise silently un-migrate the
+  // frontend. Outside prerelease mode the only specs this touches are those
+  // three, so the unconditional path costs nothing when none exist.
+  {
     const pkgNow = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as {
       dependencies?: Record<string, string>;
       devDependencies?: Record<string, string>;
     };
     const repinRuntime: string[] = [];
     const repinDev: string[] = [];
-    const specs = { ...specSnapshot.dependencies, ...specSnapshot.devDependencies };
+    const specs = {
+      ...specSnapshot.dependencies,
+      ...specSnapshot.devDependencies,
+    };
     for (const [name, spec] of Object.entries(specs)) {
-      if (!isPrereleaseVersion(cleanVersion(spec))) continue;
+      if (!isPrereleaseVersion(cleanVersion(spec)) && !NPM_LINE_PINNED.has(name)) continue;
       const currentSpec = pkgNow.dependencies?.[name] ?? pkgNow.devDependencies?.[name];
       if (currentSpec === spec) continue;
       const isDev = (specSnapshot.devDependencies ?? {})[name] !== undefined;
@@ -679,24 +1804,27 @@ async function updateEverything() {
     if (repinRuntime.length > 0) {
       const { success: repinRuntimeOk } = runCmd('bun', ['add', ...repinRuntime]);
       if (!repinRuntimeOk) {
-        console.error('❌ Error: prerelease runtime re-pin failed after bun update --latest!');
+        console.error('❌ Error: exact-pin restore failed after bun update --latest!');
         process.exit(1);
       }
     }
     if (repinDev.length > 0) {
       const { success: repinDevOk } = runCmd('bun', ['add', '-d', ...repinDev]);
       if (!repinDevOk) {
-        console.error('❌ Error: prerelease dev re-pin failed after bun update --latest!');
+        console.error('❌ Error: exact-pin restore failed after bun update --latest!');
         process.exit(1);
       }
     }
     if (repinRuntime.length > 0 || repinDev.length > 0) {
       console.log(
-        '✅ Step 4b/7: Re-pinned exact prerelease targets (bun update --latest clobber guard)\n'
+        '🔄 Step 4b/7: Restored exact pins `bun update --latest` moved (clobber guard)\n'
       );
     }
   }
 
+  // Read after step 4b, so the audit reports what the run left installed
+  // rather than the version `bun update --latest` briefly clobbered it to.
+  const afterBunLock = parseBunInstalledVersions();
   const subDepChanges: SubDepDiff[] = [];
 
   // Track Bun Sub-dependency changes
@@ -704,7 +1832,12 @@ async function updateEverything() {
     const beforeVer = beforeBunLock[name];
     const afterVer = afterBunLock[name];
     if (beforeVer && afterVer && beforeVer !== afterVer) {
-      subDepChanges.push({ name, ecosystem: 'NPM (Bun)', before: beforeVer, after: afterVer });
+      subDepChanges.push({
+        name,
+        ecosystem: 'NPM (Bun)',
+        before: beforeVer,
+        after: afterVer,
+      });
     }
   });
 
@@ -713,100 +1846,155 @@ async function updateEverything() {
     const beforeVer = beforeCargoLock[name];
     const afterVer = afterCargoLock[name];
     if (beforeVer && afterVer && beforeVer !== afterVer) {
-      subDepChanges.push({ name, ecosystem: 'Cargo (Rust)', before: beforeVer, after: afterVer });
+      subDepChanges.push({
+        name,
+        ecosystem: 'Cargo (Rust)',
+        before: beforeVer,
+        after: afterVer,
+      });
     }
   });
 
-  // --- Step 5: TypeScript Static Type Checking ---
-  console.log('📐 Step 5/7: Validating TypeScript Static Types (bun x tsc -b)...');
-  const { success: tscSuccess, durationMs: tscMs } = runCmd('bun', ['x', 'tsc', '-b']);
-  if (!tscSuccess) {
-    console.error('❌ Error: TypeScript type checking failed!');
-    process.exit(1);
-  } else {
-    console.log(`✅ Step 5/7 Complete (${tscMs}ms)\n`);
-  }
+  // --- Steps 5-7: prove the new resolution still compiles ---
+  // Not optional, and there is no flag that makes it so: everything that
+  // reaches the lockfile is already written by this point, so the only thing
+  // these three steps can still catch is a resolution that *resolves* but does
+  // not *build* — the one failure a lockfile diff cannot show. A dependency
+  // bump is exactly the change that needs that proof, so the run pays for it
+  // here rather than deferring it to a caller that would run a smaller version
+  // of it (the gate's `typecheck`, and clippy rather than a real build).
+  {
+    // --- Step 5: TypeScript Static Type Checking ---
+    console.log('📐 Step 5/7: Validating TypeScript Static Types (bun x tsc -b)...');
+    const { success: tscSuccess, durationMs: tscMs } = runCmd('bun', ['x', 'tsc', '-b']);
+    if (!tscSuccess) {
+      console.error('❌ Error: TypeScript type checking failed!');
+      process.exit(1);
+    } else {
+      console.log(`✅ Step 5/7 Complete (${tscMs}ms)\n`);
+    }
 
-  // --- Step 6: Vite Production Frontend Build Validation ---
-  console.log('⚡ Step 6/7: Validating Vite Production Frontend Build (bun run vite:build)...');
-  const { success: buildSuccess, durationMs: buildMs } = runCmd('bun', ['run', 'vite:build']);
-  if (!buildSuccess) {
-    console.error('❌ Error: Vite production build failed!');
-    process.exit(1);
-  } else {
-    console.log(`✅ Step 6/7 Complete (${buildMs}ms)\n`);
-  }
+    // --- Step 6: Vite Production Frontend Build Validation ---
+    console.log('⚡ Step 6/7: Validating Vite Production Frontend Build (bun run vite:build)...');
+    const { success: buildSuccess, durationMs: buildMs } = runCmd('bun', ['run', 'vite:build']);
+    if (!buildSuccess) {
+      console.error('❌ Error: Vite production build failed!');
+      process.exit(1);
+    } else {
+      console.log(`✅ Step 6/7 Complete (${buildMs}ms)\n`);
+    }
 
-  // --- Step 7: Native Cargo Backend Compilation Verification ---
-  console.log('🔍 Step 7/7: Checking Cargo Rust Backend Compilation (cargo check)...');
-  const { success: checkSuccess, durationMs: checkMs } = runCmd('cargo', ['check'], cargoCwd);
-  if (!checkSuccess) {
-    console.error('❌ Error: Cargo compilation check failed!');
-    process.exit(1);
-  } else {
-    console.log(`✅ Step 7/7 Complete (${checkMs}ms)\n`);
+    // --- Step 7: Native Cargo Backend Compilation Verification ---
+    console.log(
+      '🔍 Step 7/7: Checking Cargo Rust Backend Compilation (cargo check, debug + release)...'
+    );
+    // Both profiles, because they compile different code: the WebView2
+    // hardening in `webview_hardening.rs` exists only without
+    // `debug_assertions`, and it is the code that names the `webview2-com` /
+    // `windows-core` / `tauri-runtime-wry` types a dependency bump is most
+    // likely to skew. A debug-only check passed that skew straight through.
+    const debugCheck = runCmd('cargo', ['check'], cargoCwd);
+    const releaseCheck = debugCheck.success
+      ? runCmd('cargo', ['check', '--release'], cargoCwd)
+      : debugCheck;
+    const checkSuccess = debugCheck.success && releaseCheck.success;
+    const checkMs =
+      debugCheck.durationMs + (releaseCheck === debugCheck ? 0 : releaseCheck.durationMs);
+    if (!checkSuccess) {
+      console.error('❌ Error: Cargo compilation check failed!');
+      process.exit(1);
+    } else {
+      console.log(`✅ Step 7/7 Complete (${checkMs}ms)\n`);
+    }
   }
-
-  // --- Synchronize Architecture Map ---
-  console.log('📐 Synchronizing ARCHITECTURE.md...');
-  const { success: archSuccess } = runCmd('bun', ['run', 'arch']);
-  if (archSuccess) console.log('✅ ARCHITECTURE.md updated!\n');
 
   const totalDirectCount = allStatuses.length;
   const totalSubCrates = Object.keys(afterCargoLock).length;
   const totalSubNpm = Object.keys(afterBunLock).length;
-  const totalGraphCount = totalDirectCount + totalSubCrates + totalSubNpm;
+
+  // What actually happened to each direct dependency, judged from the
+  // lockfile after the run — not from what was merely requested.
+  const statusLabel = (s: DependencyStatus): string => {
+    if (heldCargo.has(s.name)) return '⏸ Held (see notes)';
+    // "Already @latest" would be a lie for a held package: a line pin is on its
+    // line and `latest` is the one thing it is deliberately not following, and
+    // a ceilinged package may be sitting below a `latest` it is refusing.
+    if (!s.needsUpdate) {
+      if (s.linePin) return `📌 On the ${s.linePin.major}.x line`;
+      if (s.majorCeiling !== undefined) return `🔒 On ${ceilingLabel(s.majorCeiling)}`;
+      return '⚡ Already @latest';
+    }
+    if (s.ecosystem === 'Cargo (Rust)') {
+      const before = beforeCargoLock[s.name];
+      const after = afterCargoLock[s.name];
+      if (before && after && before === after && compareVersions(after, s.latestVersion) >= 0) {
+        return `✏️ Spec → ^${s.latestVersion} (lock already had ${after})`;
+      }
+    }
+    return s.prerelease ? '⚠️ Pre-release' : '✨ Upgraded';
+  };
 
   // --- Print Direct Dependency Summary Report ---
   console.log('=================================================================');
-  console.log('📊 DIRECT DEPENDENCY STATUS REPORT (' + totalDirectCount + ' DIRECT PACKAGES)');
+  console.log(`📊 DIRECT DEPENDENCY STATUS REPORT (${totalDirectCount} DIRECT PACKAGES)`);
   console.log('=================================================================');
-  console.log(' Dependency / Crate Name           | Ecosystem    | Current   | Latest    | Status');
-  console.log(
-    '------------------------------------+--------------+-----------+-----------+-------------------'
+  printTable(
+    ['Dependency / Crate Name', 'Ecosystem', 'Current', 'Latest', 'Status'],
+    allStatuses
+      .toSorted((a, b) => a.name.localeCompare(b.name))
+      .map((s) => [s.name, ecosystemLabel(s), s.currentVersion, s.latestVersion, statusLabel(s)])
   );
-  allStatuses
-    .toSorted((a, b) => a.name.localeCompare(b.name))
-    .forEach((s) => {
-      const namePadded = s.name.padEnd(34, ' ');
-      const ecoPadded = s.ecosystem.padEnd(12, ' ');
-      const currPadded = s.currentVersion.padEnd(9, ' ');
-      const latPadded = s.latestVersion.padEnd(9, ' ');
-      const statusText = s.needsUpdate
-        ? s.prerelease
-          ? '⚠️ Pre-release'
-          : '✨ Upgraded'
-        : '⚡ Already @latest';
-      console.log(` ${namePadded} | ${ecoPadded} | ${currPadded} | ${latPadded} | ${statusText}`);
-    });
+  if (heldCargo.size > 0) {
+    console.log('\n ⏸ Held back this run (Cargo.toml spec left as it was):');
+    for (const [name, reason] of heldCargo) {
+      console.log(`    ${name}: ${reason}`);
+    }
+  }
+  printHeldNotes(allStatuses);
   console.log('=================================================================\n');
 
-  // --- Print Transitive Sub-Dependency Upgrade Report ---
+  // --- Transitive audit: what moved, and what cargo cannot move ---
   console.log('=================================================================');
   console.log(
-    `🔗 TRANSITIVE SUB-DEPENDENCY INVENTORY AUDIT (${totalSubCrates} Rust Sub-Crates + ${totalSubNpm} NPM Sub-Packages)`
+    `🔗 TRANSITIVE SUB-DEPENDENCY AUDIT (${totalSubCrates} Rust crates + ${totalSubNpm} NPM packages in the lockfiles)`
   );
   console.log('=================================================================');
   if (subDepChanges.length === 0) {
-    console.log(
-      ` ⚡ All ${totalSubCrates + totalSubNpm} sub-crates & sub-sub-dependencies are verified at their latest versions.`
-    );
+    console.log(' ⚡ No transitive package changed in this run.');
   } else {
-    console.log(' Sub-Dependency Name               | Ecosystem    | Before    | Upgraded');
-    console.log('------------------------------------+--------------+-----------+-----------');
-    subDepChanges
-      .toSorted((a, b) => a.name.localeCompare(b.name))
-      .forEach((sd) => {
-        const namePadded = sd.name.padEnd(34, ' ');
-        const ecoPadded = sd.ecosystem.padEnd(12, ' ');
-        const beforePadded = sd.before.padEnd(9, ' ');
-        console.log(` ${namePadded} | ${ecoPadded} | ${beforePadded} | ${sd.after}`);
-      });
+    console.log(` ✨ ${subDepChanges.length} transitive package(s) moved:`);
+    printTable(
+      ['Sub-Dependency Name', 'Ecosystem', 'Before', 'After'],
+      subDepChanges
+        .toSorted((a, b) => a.name.localeCompare(b.name))
+        .map((sd) => [sd.name, sd.ecosystem, sd.before, sd.after])
+    );
+  }
+  console.log(' 🔎 Asking cargo which crates it could not move…');
+  const behind = listCratesBehindLatest(cargoCwd).filter((b) => !heldCargo.has(b.name));
+  if (behind.length > 0) {
+    console.log(
+      ` ⏳ ${behind.length} crate(s) are newer on crates.io but pinned by a requirement in the graph:`
+    );
+    printTable(
+      ['Crate', 'Locked', 'Available', 'Required by'],
+      behind.map((b) => [b.name, b.current, b.available, b.requiredBy])
+    );
   }
   console.log('=================================================================');
-  console.log(
-    `🎉 Entire dependency tree (${totalGraphCount} total packages & sub-crates) is 100% up-to-date!\n`
-  );
+  await auditGithubActions();
+  if (heldCargo.size === 0 && behind.length === 0) {
+    console.log(
+      `🎉 Entire dependency tree (${totalDirectCount + totalSubCrates + totalSubNpm} packages) is up to date.\n`
+    );
+  } else {
+    console.log(
+      `🏁 Done. ${heldCargo.size} direct crate(s) held back, ${behind.length} transitive crate(s) behind latest — see the notes above; everything else is up to date.\n`
+    );
+  }
 }
 
-updateEverything();
+updateEverything().catch((err) => {
+  console.error('❌ Fatal unhandled error:', err);
+  process.exit(1);
+});

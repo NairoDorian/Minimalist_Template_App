@@ -114,7 +114,7 @@ capability, a `tsconfig` flag — read the mirror:
 
 ```bash
 bun run docs:sync                   # first time, or to refresh
-bun run docs:find "createMemo"      # search Tauri 2 / SolidJS 2 / Bun / TypeScript at once
+bun run docs:find "createMemo"      # search Tauri (v2 guides + v3 source) / SolidJS 2 / Bun / TypeScript at once
 ```
 
 Cite the file you read in the PR description when a change is doc-driven. See

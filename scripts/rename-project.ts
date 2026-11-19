@@ -236,11 +236,10 @@ async function main() {
   //    published would still carry the template's name.
   if (appName) {
     const releaseWorkflow = path.join(ROOT, '.github', 'workflows', 'release.yml');
-    replaceInFile(
-      releaseWorkflow,
-      /name: "[^"]*? \$\{\{ steps\.get_version\.outputs\.tag_name \}\}"/,
-      `name: "${appName} \${{ steps.get_version.outputs.tag_name }}"`
-    );
+    // The draft-release script reads the tag from the environment (see the
+    // comment in release.yml), so the title is a JavaScript template literal
+    // over `tag`, not a `${{ }}` expression.
+    replaceInFile(releaseWorkflow, /name: `[^`]*? \$\{tag\}`/, `name: \`${appName} \${tag}\``);
     replaceInFile(
       releaseWorkflow,
       /releaseName: '[^']*? \$\{\{ needs\.create-release\.outputs\.tag_name \}\}'/,

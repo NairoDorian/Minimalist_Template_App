@@ -14,7 +14,7 @@ sequenceDiagram
     actor User
     participant Tray as System Tray Menu
     participant UI as SolidJS 2 Frontend (UpdateChecker)
-    participant Tauri as Tauri 2 Rust Backend
+    participant Tauri as Tauri 3 Rust Backend
     participant GH as GitHub Releases API
 
     User->>Tray: Click "Check for Updates..."
@@ -22,7 +22,7 @@ sequenceDiagram
     UI->>Tauri: check()  (updater plugin, over IPC)
     Tauri->>GH: HTTP GET releases/latest/download/latest.json
     GH-->>Tauri: manifest: version, notes, per-platform url + signature
-    Tauri-->>UI: Update { available, version, body }
+    Tauri-->>UI: Update { version, body } or null
     alt New Version Available
         UI->>User: Display "Install vX.Y.Z" (+ an OS notification if the window is hidden)
         User->>UI: Click "Install"
@@ -40,7 +40,7 @@ sequenceDiagram
 
 ## 🛠️ Key Components & Responsibilities
 
-### 1. Tauri 2 Config (`src-tauri/tauri.conf.json`)
+### 1. Tauri Config (`src-tauri/tauri.conf.json`)
 
 The updater plugin is configured under `bundle` and `plugins.updater`:
 
@@ -99,7 +99,7 @@ Inspired by Handy's `UpdateChecker` design:
 
 ## 🔐 Cryptographic Code Signing (Minisign)
 
-Tauri 2 requires update payloads to be signed using Minisign key pairs to prevent binary tampering.
+Tauri requires update payloads to be signed using Minisign key pairs to prevent binary tampering.
 
 ### Generating Keys
 

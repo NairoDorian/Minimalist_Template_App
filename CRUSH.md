@@ -30,7 +30,7 @@ bun run create-icons           # Regenerate multi-platform app icons
 bun run update-deps            # Automated @latest dependency upgrade pipeline
 bun run clean                  # Purge compiled Rust target artifacts
 
-# Local documentation mirrors (Tauri 2 / SolidJS 2 / Bun / TypeScript 7)
+# Local documentation mirrors (Tauri v2 guides + v3 source / SolidJS 2 / Bun / TypeScript 7)
 bun run docs:sync              # Clone or fast-forward every mirror into .docs/ (gitignored)
 bun run docs:check             # Status table: branch, commit, freshness, size
 bun run docs:find "<query>"    # Search all mirrors at once (translations excluded)

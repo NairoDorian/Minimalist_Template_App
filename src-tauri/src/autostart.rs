@@ -67,7 +67,7 @@ pub struct AutostartStatus {
 /// than as an error: on a platform or in a sandbox where the query is
 /// unavailable, an unchecked toggle is the truthful, least-surprising answer.
 fn os_registered(app: &AppHandle) -> bool {
-    app.autolaunch().is_enabled().unwrap_or_else(|err| {
+    app.autostart().is_enabled().unwrap_or_else(|err| {
         log::warn!("[autostart] Could not query the OS launch entry: {err}");
         false
     })
@@ -98,7 +98,7 @@ pub fn reconcile(app: &AppHandle, enabled: bool) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let manager = app.autolaunch();
+    let manager = app.autostart();
     let result = if enabled {
         manager.enable()
     } else {
@@ -120,7 +120,14 @@ pub fn reconcile(app: &AppHandle, enabled: bool) -> Result<bool, String> {
 /// registry key would be trading a small problem for a total one.
 pub fn reconcile_on_startup(app: &AppHandle, enabled: bool) {
     // Skip the no-op case so a normal launch does not touch the registry at all.
-    if !is_dev_build() && enabled == os_registered(app) {
+    //
+    // In every build, not just release: when the preference and the OS already
+    // agree there is nothing a release build would write, so there is nothing
+    // for a dev build to decline either. Gating this on the build kind made
+    // every `tauri dev` start log a WARN about "leaving the OS entry untouched"
+    // with autostart off and nothing registered — noise that trained the eye to
+    // skip the one case the warning exists for (they disagree).
+    if enabled == os_registered(app) {
         return;
     }
 

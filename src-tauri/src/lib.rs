@@ -392,16 +392,75 @@ fn save_settings_to_disk(path: &Path, settings: &AppSettings) -> Result<(), Stri
 
     // Atomic persistence: write to an adjacent temporary file first, then atomically rename.
     let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, json.as_bytes())
+    write_synced(&tmp_path, json.as_bytes())
         .map_err(|e| format!("Failed to write temporary settings file: {e}"))?;
 
-    fs::rename(&tmp_path, path)
-        .or_else(|_| {
-            // Fallback for filesystem targets where atomic replace requires removing the target first
-            let _ = fs::remove_file(path);
-            fs::rename(&tmp_path, path)
-        })
-        .map_err(|e| format!("Failed to commit settings file: {e}"))
+    replace_file(&tmp_path, path).map_err(|e| {
+        // The live file is untouched on this path; only the scratch copy goes.
+        let _ = fs::remove_file(&tmp_path);
+        format!("Failed to commit settings file: {e}")
+    })
+}
+
+/// Writes `bytes` to `path` and flushes them to the storage device.
+///
+/// The `sync_all` is what makes the write-then-rename above actually atomic
+/// against power loss. Without it the rename (a metadata operation) can reach
+/// the disk before the file's data blocks do, and the crash leaves a
+/// `settings.json` of the right name and zero or garbage length — the exact
+/// outcome the temp-file dance exists to prevent. One fsync per preference
+/// change is nothing; preference changes are human-paced, and geometry is
+/// batched into one write per hide/close (`flush_window_geometry`).
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// How many times a failed rename is retried before the move-aside fallback.
+const REPLACE_ATTEMPTS: u32 = 4;
+
+/// Moves `from` over `to`, and never leaves `to` missing.
+///
+/// `fs::rename` replaces atomically on every platform this app targets
+/// (`rename(2)`; `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows). On
+/// Windows it can still fail *transiently* — an antivirus scanner or the search
+/// indexer briefly holding `settings.json` open is the classic cause — so the
+/// rename is retried with a short backoff first. The sleeps only happen on the
+/// failure path.
+///
+/// The previous fallback deleted `to` and then retried the rename, so if that
+/// second rename also failed the user's settings were simply gone (the next
+/// launch found no file and started from defaults). The fallback now moves the
+/// old file *aside* first and moves it back if the new one cannot take its
+/// place: at every instant one complete settings file exists under a known name.
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut last_error = None;
+    for attempt in 1..=REPLACE_ATTEMPTS {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err);
+                if attempt < REPLACE_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(15 * u64::from(attempt)));
+                }
+            }
+        }
+    }
+
+    if !to.exists() {
+        return Err(last_error.unwrap_or_else(|| std::io::Error::other("rename failed")));
+    }
+    let aside = to.with_extension("json.old");
+    fs::rename(to, &aside)?;
+    if let Err(err) = fs::rename(from, to) {
+        // Put the original back; if even that fails it survives as `.json.old`.
+        let _ = fs::rename(&aside, to);
+        return Err(err);
+    }
+    let _ = fs::remove_file(&aside);
+    Ok(())
 }
 
 /// Tauri IPC command: Retrieves current minimize-to-tray preference.
@@ -479,23 +538,87 @@ fn update_app_settings(
         }
     }
 
+    // The struct arrives whole (a restored backup, a toggle's read-modify-write),
+    // so the hotkey invariants `set_global_hotkey` enforces one binding at a time
+    // are re-established here for the entire list — see `normalize_bindings`.
+    let (bindings, notes) = global_hotkeys::normalize_bindings(settings.global_hotkeys);
+    for note in &notes {
+        log::warn!("[settings] update_app_settings {note}");
+    }
+    settings.global_hotkeys = bindings;
+    // The document being written is the current struct's shape, whatever
+    // version number the caller echoed back (an imported backup carries the
+    // version it was exported at). Stamping it keeps the next launch from
+    // re-walking a migration ladder the data has already been through.
+    settings.settings_version = settings_migrate::CURRENT_SETTINGS_VERSION;
+
     // Held across the write so concurrent savers can't interleave and leave the
     // file describing one struct while memory holds another.
-    let mut current = lock_guard(&state.settings);
-    save_settings_to_disk(&state.settings_path, &settings)?;
-    *current = settings;
+    let previous = {
+        let mut current = lock_guard(&state.settings);
+        save_settings_to_disk(&state.settings_path, &settings)?;
+        std::mem::replace(&mut *current, settings.clone())
+    };
+    apply_settings_side_effects(&app, &state, &previous, &settings);
     Ok(())
 }
 
 /// Tauri IPC command: Restores `AppSettings` to factory defaults and persists to disk.
 #[tauri::command]
 #[specta::specta]
-fn reset_app_settings(state: State<'_, AppState>) -> Result<(), String> {
-    let mut current = lock_guard(&state.settings);
+fn reset_app_settings(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let defaults = AppSettings::default();
-    save_settings_to_disk(&state.settings_path, &defaults)?;
-    *current = defaults;
+    let previous = {
+        let mut current = lock_guard(&state.settings);
+        save_settings_to_disk(&state.settings_path, &defaults)?;
+        std::mem::replace(&mut *current, defaults.clone())
+    };
+    apply_settings_side_effects(&app, &state, &previous, &defaults);
     Ok(())
+}
+
+/// Carries out what a whole-struct settings write *means* outside the file.
+///
+/// Two preferences are not just data: `global_hotkeys(_enabled)` drives a live
+/// OS keyboard hook, and `autostart_enabled` drives an OS login entry. The
+/// single-field commands (`set_global_hotkey`, `set_global_hotkeys_enabled`,
+/// `set_autostart`) each apply their own effect, but `update_app_settings` and
+/// `reset_app_settings` replace the whole struct — and used to stop at the
+/// file. "Reset to factory defaults" therefore left the old hotkeys firing and
+/// the login entry registered until the next restart (and that stale entry is
+/// what *caused* the next start); restoring a backup changed both on disk and
+/// neither in the OS.
+///
+/// Runs after the write has succeeded and after the settings lock is released:
+/// rebuilding the hotkey listener joins its dispatch thread, which touches
+/// windows, and the autostart call can block on the OS. Only fields that
+/// actually changed are acted on, so an ordinary toggle costs nothing here. A
+/// failed autostart reconcile is logged rather than returned: the preference is
+/// already persisted (disk-first, like every writer here), startup
+/// reconciliation retries it, and an `Err` would make the frontend roll back a
+/// change that did in fact save.
+fn apply_settings_side_effects(
+    app: &AppHandle,
+    state: &AppState,
+    before: &AppSettings,
+    after: &AppSettings,
+) {
+    if before.global_hotkeys_enabled != after.global_hotkeys_enabled
+        || before.global_hotkeys != after.global_hotkeys
+    {
+        state
+            .global_hotkeys
+            .apply(app, after.global_hotkeys_enabled, &after.global_hotkeys);
+    }
+    if before.autostart_enabled != after.autostart_enabled
+        && let Err(err) = autostart::reconcile(app, after.autostart_enabled)
+    {
+        log::warn!(
+            "[autostart] The preference changed to {} but the OS entry could not follow: {err} \
+             — it will be retried at the next launch",
+            after.autostart_enabled
+        );
+    }
 }
 
 /// Returns application and runtime system diagnostic information.
@@ -1073,10 +1196,20 @@ const BINDINGS_PATH: &str = "../src/bindings.ts";
 /// buried in the builder chain. Drift between this registry and the committed
 /// `src/bindings.ts` is caught by `test/bindings.test.ts`, which compares the two
 /// as source text — a Rust test cannot re-render the bindings, because
-/// referencing the builder links `tauri::Wry` and the resulting test executable
-/// will not start on Windows without the webview runtime beside it.
-fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
-    tauri_specta::Builder::<tauri::Wry>::new()
+/// referencing the builder links the webview runtime and the resulting test
+/// executable will not start on Windows without WebView2's loader beside it.
+///
+/// Typed on `tauri::DynRuntime`, the type-erased runtime Tauri 3's
+/// `Builder::default()` produces. `tauri::Wry` no longer exists: the runtime is
+/// its own crate and is *selected* in `run()` rather than named here, so the
+/// IPC surface is independent of which webview runtime powers the app.
+///
+/// `ErrorHandlingMode::Throw` is set explicitly even though tauri-specta rc.27
+/// made it the default: every frontend caller relies on a failed command
+/// rejecting its promise (the optimistic-rollback `catch` blocks), and an
+/// upstream default is not a contract.
+fn specta_builder() -> tauri_specta::Builder<tauri::DynRuntime> {
+    tauri_specta::Builder::<tauri::DynRuntime>::new()
         .error_handling(tauri_specta::ErrorHandlingMode::Throw)
         .commands(collect_commands![
             get_minimize_to_tray,
@@ -1178,6 +1311,12 @@ pub fn run(cli: cli::CliArgs) {
         .expect("Failed to export typescript bindings");
 
     tauri::Builder::default()
+        // Tauri 3 does not bundle a webview runtime: `Builder::default()` is the
+        // type-erased `DynRuntime`, and building fails with
+        // `RuntimeNotConfigured` until one is selected here. Wry is the system
+        // webview (WebView2 / WKWebView / WebKitGTK) — the only runtime this
+        // template ships. See `.docs/tauri-v3/.changes/runtime-selection.md`.
+        .runtime(tauri_runtime_wry::Wry::default())
         // Single-instance guard: prevents duplicate tray icons — and, more
         // usefully, turns a second launch into a message to the first.
         //
@@ -1496,6 +1635,49 @@ mod tests {
         let decoded: AppSettings = serde_json::from_str(&json).expect("deserialization failed");
 
         assert_eq!(settings, decoded);
+    }
+
+    #[test]
+    fn test_overwrite_replaces_content_and_leaves_no_scratch_files() {
+        let temp_dir = std::env::temp_dir().join(format!("tauri_replace_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::create_dir_all(&temp_dir);
+        let settings_path = temp_dir.join("settings.json");
+
+        let first = AppSettings::default();
+        let second = AppSettings {
+            theme_accent: "amber".to_string(),
+            ..AppSettings::default()
+        };
+        save_settings_to_disk(&settings_path, &first).expect("first save");
+        save_settings_to_disk(&settings_path, &second).expect("overwrite");
+
+        assert_eq!(load_settings_from_disk(&settings_path), second);
+        assert!(!settings_path.with_extension("tmp").exists());
+        assert!(!settings_path.with_extension("json.old").exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_a_failed_commit_never_removes_the_live_file() {
+        // The scratch file's source vanishes before the move, so every rename
+        // attempt fails — the shape of the old remove-then-rename data loss.
+        let temp_dir = std::env::temp_dir().join(format!("tauri_nolose_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::create_dir_all(&temp_dir);
+        let live = temp_dir.join("settings.json");
+        fs::write(&live, b"{\"theme_accent\":\"rose\"}").expect("seed live file");
+
+        let missing_source = temp_dir.join("settings.tmp");
+        assert!(replace_file(&missing_source, &live).is_err());
+        assert_eq!(
+            fs::read_to_string(&live).expect("live file must survive"),
+            "{\"theme_accent\":\"rose\"}"
+        );
+        assert!(!live.with_extension("json.old").exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
